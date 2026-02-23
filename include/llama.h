@@ -694,6 +694,190 @@ extern "C" {
                          int32_t   il_end);
 
     //
+    // Runtime Behavior Intervention API
+    //
+
+    // Part A: Activation capture — for computing control vectors at runtime
+    // Enable/disable capture of per-layer hidden state outputs during decode.
+    // When enabled, the last token's hidden state from each transformer layer
+    // will be stored after each decode() call.
+    LLAMA_API void llama_set_capture_layer_outputs(struct llama_context * ctx, bool enabled);
+
+    // Get the number of layers captured in the last decode() call.
+    // Returns 0 if capture is not enabled or no decode has been performed.
+    LLAMA_API int32_t llama_get_n_captured_layers(struct llama_context * ctx);
+
+    // Get the captured hidden state for a specific layer from the last decode() call.
+    // Returns a pointer to n_embd floats, or NULL if the layer was not captured.
+    LLAMA_API const float * llama_get_captured_layer_output(struct llama_context * ctx, int32_t layer_id);
+
+    // Part C: Attention score bias injection — boost attention to specific token ranges
+    // Adds a log-space bias to attention scores for token positions [start_pos, end_pos)
+    // at layers [layer_start, layer_end). Applied pre-softmax.
+    // bias > 0 boosts attention (exp(bias) multiplier), bias < 0 suppresses.
+    // Disables flash attention for affected layers.
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_set_attention_bias(
+            struct llama_context * ctx,
+                         int32_t   start_pos,
+                         int32_t   end_pos,
+                           float   bias,
+                         int32_t   layer_start,
+                         int32_t   layer_end);
+
+    // Clear all attention biases, restoring default attention behavior.
+    LLAMA_API void llama_clear_attention_bias(struct llama_context * ctx);
+
+    // Part D: Head rescaling — per-head scalar multiplier on attention output
+    // scale = 1.0 (default), 0.0 (ablate), 2.0 (amplify), -1.0 (reverse)
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_set_head_scale(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                         int32_t   head,
+                           float   scale);
+
+    // Reset all head scales to 1.0 (default).
+    LLAMA_API void llama_reset_head_scales(struct llama_context * ctx);
+
+    // Part E: Attention temperature — per-head softmax temperature
+    // T < 1.0 = sharper (more focused), T > 1.0 = flatter (broader attention)
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_set_attention_temperature(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                         int32_t   head,
+                           float   temperature);
+
+    // Reset all attention temperatures to 1.0 (default).
+    LLAMA_API void llama_reset_attention_temperatures(struct llama_context * ctx);
+
+    // Gated Residual — per-layer scalar gate on attention and FFN residual outputs.
+    // Values in [0, 2]: 0 = skip layer, 1 = default (no change), 2 = amplify.
+    // attn_gates and ffn_gates are arrays of n_layer floats (pass NULL to clear one).
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_set_residual_gates(
+            struct llama_context * ctx,
+                     const float * attn_gates,
+                     const float * ffn_gates,
+                         int32_t   n_layer);
+
+    // Reset all residual gates to default (1.0, no scaling).
+    LLAMA_API void llama_reset_residual_gates(struct llama_context * ctx);
+
+    // Speculative decoding: early exit layer.
+    // When layer > 0, the model graph only processes the first `layer` transformer blocks,
+    // then applies output_norm + lm_head to produce draft logits.
+    // Set layer=-1 or 0 to disable (use all layers). Returns 0 on success.
+    LLAMA_API int32_t llama_set_early_exit_layer(
+            struct llama_context * ctx,
+                         int32_t   layer);
+
+    // Reset early exit (use all layers for full model inference).
+    LLAMA_API void llama_reset_early_exit_layer(struct llama_context * ctx);
+
+    // Part G: LayerNorm affine shift — per-layer additive offset after normalization.
+    // Cheapest personality modification — one element-wise add per layer, zero flash-attention penalty.
+    // offsets is an array of n_embd floats added to the normalized output at the given layer.
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_set_norm_offsets(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                   const float   * offsets,
+                         int32_t   n_embd);
+
+    // Reset all norm offsets (remove all LayerNorm shifts).
+    LLAMA_API void llama_reset_norm_offsets(struct llama_context * ctx);
+
+    // Save/Load learnable intervention state (KAN coefficients, sparse masks).
+    // Persists learned parameters to a binary file so they survive app restart.
+    // File format is versioned and backward-compatible.
+    // Returns 0 on success, negative on error.
+    LLAMA_API int32_t llama_save_intervention_state(struct llama_context * ctx, const char * path);
+    LLAMA_API int32_t llama_load_intervention_state(struct llama_context * ctx, const char * path);
+
+    // Part P5: Dynamic sparse masks — per-layer FFN neuron masking.
+    // Selectively enables/disables FFN neurons at runtime. Mask values in [0, 1].
+    // Applied via ggml_mul before down-projection in build_ffn().
+    // mask is an array of n_ff floats. Returns 0 on success.
+    LLAMA_API int32_t llama_set_sparse_mask(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                   const float   * mask,
+                         int32_t   n_ff);
+
+    // Initialize all sparse masks to 1.0 (all neurons active).
+    // If keep_ratio < 1.0, randomly disables (1-keep_ratio) fraction of neurons.
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_init_sparse_masks(
+            struct llama_context * ctx,
+                           float   keep_ratio);
+
+    // Remove all sparse masks (all neurons fully active).
+    LLAMA_API void llama_reset_sparse_masks(struct llama_context * ctx);
+
+    // Part P6: KAN-lite — learnable activation overlay via piecewise-linear spline.
+    // Adds a small spline residual after the FFN activation: output = activation(x) + alpha * spline(x).
+    // Coefficients are per-layer, with n_knots = 8 (grid: -4 to +3, spacing 1.0).
+    // Init all coefficients to 0 for identity behavior. Tune via forward-only learning (P7).
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_set_kan_coefficients(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                   const float   * coefficients,
+                         int32_t   n_knots);
+
+    // Set global KAN strength multiplier. 0 = disabled (default).
+    LLAMA_API void llama_set_kan_alpha(struct llama_context * ctx, float alpha);
+
+    // Reset KAN overlay (clear all coefficients and set alpha to 0).
+    LLAMA_API void llama_reset_kan(struct llama_context * ctx);
+
+    // Part P4: Hypernetwork — per-target-layer FFN LoRA adaptation.
+    // Low-rank (rank typically 4) adaptation of FFN up-projection for middle layers.
+    // Applied as: up_output += strength * B^T(A^T(ffn_input)) per target layer.
+    // A initialized with small random values, B with zeros (net effect = zero initially).
+    // Returns 0 on success, negative on error.
+    LLAMA_API int32_t llama_init_hypernetwork(
+            struct llama_context * ctx,
+                         int32_t   rank,          // LoRA rank (typically 4)
+                         int32_t   layer_start,   // first target layer (-1 = auto: 37%)
+                         int32_t   layer_end,     // one past last (-1 = auto: 70%)
+                           float   strength);     // global strength (0 = disabled)
+
+    // Set LoRA A and/or B matrices for a specific target layer index.
+    // target_idx is relative (0 = first target layer, NOT model layer index).
+    // Pass NULL for a or b to skip updating that matrix.
+    LLAMA_API int32_t llama_set_hypernetwork_lora(
+            struct llama_context * ctx,
+                         int32_t   target_idx,
+                   const float   * a,             // [rank * n_embd] or NULL
+                         int32_t   a_size,
+                   const float   * b,             // [n_ff * rank] or NULL
+                         int32_t   b_size);
+
+    // Set hypernetwork global strength multiplier.
+    LLAMA_API void llama_set_hypernetwork_strength(struct llama_context * ctx, float strength);
+
+    // Reset hypernetwork (remove all LoRA matrices, disable).
+    LLAMA_API void llama_reset_hypernetwork(struct llama_context * ctx);
+
+    // Part P7: Forward-only learning via SPSA perturbation.
+    // Tunes KAN coefficients by running 2 forward passes on the given tokens
+    // with perturbed parameters and estimating the gradient. Uses a temporary
+    // probe context (shares model weights, ~3MB extra memory).
+    // Call between conversation turns with the last generated response tokens.
+    //   learning_rate: step size (typical: 0.001-0.01)
+    //   noise_scale:   perturbation magnitude (typical: 0.01-0.1)
+    //   Returns: estimated loss difference (positive = improvement)
+    LLAMA_API float llama_forward_learn_step(
+            struct llama_context * ctx,
+               const llama_token * tokens,
+                         int32_t   n_tokens,
+                           float   learning_rate,
+                           float   noise_scale);
+
+    //
     // Memory
     //
 

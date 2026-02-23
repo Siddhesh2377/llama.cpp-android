@@ -547,6 +547,164 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+void llm_graph_input_head_intervention::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    // fill head scale tensors
+    if (head_scales && !head_scales->empty()) {
+        for (int il = 0; il < n_layer; il++) {
+            if (scale_tensors[il] && il < (int)head_scales->size()) {
+                ggml_backend_tensor_set(scale_tensors[il],
+                    (*head_scales)[il].data(), 0,
+                    n_head * sizeof(float));
+            }
+        }
+    }
+
+    // fill inverse temperature tensors (store 1/T so we can multiply rather than divide)
+    if (attn_temperatures && !attn_temperatures->empty()) {
+        std::vector<float> inv_temps(n_head);
+        for (int il = 0; il < n_layer; il++) {
+            if (temp_tensors[il] && il < (int)attn_temperatures->size()) {
+                for (int h = 0; h < n_head; h++) {
+                    float t = (*attn_temperatures)[il][h];
+                    inv_temps[h] = (t > 0.0f) ? (1.0f / t) : 1.0f;
+                }
+                ggml_backend_tensor_set(temp_tensors[il],
+                    inv_temps.data(), 0,
+                    n_head * sizeof(float));
+            }
+        }
+    }
+}
+
+void llm_graph_input_norm_offsets::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!norm_offsets || norm_offsets->empty()) return;
+
+    for (int il = 0; il < n_layer; il++) {
+        if (offset_tensors[il] && il < (int)norm_offsets->size() && !(*norm_offsets)[il].empty()) {
+            ggml_backend_tensor_set(offset_tensors[il],
+                (*norm_offsets)[il].data(), 0,
+                n_embd * sizeof(float));
+        }
+    }
+}
+
+void llm_graph_input_hypernetwork::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!lora_a || !lora_b || lora_a->empty() || strength == 0.0f) return;
+
+    int n_target = layer_end - layer_start;
+    for (int ti = 0; ti < n_target; ti++) {
+        if (ti < (int)lora_a->size() && a_tensors[ti] && !(*lora_a)[ti].empty()) {
+            ggml_backend_tensor_set(a_tensors[ti],
+                (*lora_a)[ti].data(), 0,
+                (*lora_a)[ti].size() * sizeof(float));
+        }
+        if (ti < (int)lora_b->size() && b_tensors[ti] && !(*lora_b)[ti].empty()) {
+            ggml_backend_tensor_set(b_tensors[ti],
+                (*lora_b)[ti].data(), 0,
+                (*lora_b)[ti].size() * sizeof(float));
+        }
+    }
+}
+
+void llm_graph_input_sparse_mask::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!sparse_masks || sparse_masks->empty()) return;
+
+    for (int il = 0; il < n_layer; il++) {
+        if (mask_tensors[il] && il < (int)sparse_masks->size() && !(*sparse_masks)[il].empty()) {
+            ggml_backend_tensor_set(mask_tensors[il],
+                (*sparse_masks)[il].data(), 0,
+                (*sparse_masks)[il].size() * sizeof(float));
+        }
+    }
+}
+
+void llm_graph_input_kan::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!kan_coefficients || kan_coefficients->empty() || kan_alpha <= 0.0f) return;
+
+    for (int il = 0; il < n_layer; il++) {
+        // Fill per-layer data struct for the custom op callback
+        layer_data[il].alpha = kan_alpha;
+        if (il < (int)kan_coefficients->size() && (int)(*kan_coefficients)[il].size() >= KAN_N_KNOTS) {
+            for (int k = 0; k < KAN_N_KNOTS; k++) {
+                layer_data[il].coefficients[k] = (*kan_coefficients)[il][k];
+            }
+        } else {
+            // No coefficients for this layer — zero out (identity)
+            for (int k = 0; k < KAN_N_KNOTS; k++) {
+                layer_data[il].coefficients[k] = 0.0f;
+            }
+            layer_data[il].alpha = 0.0f;
+        }
+    }
+}
+
+// KAN-lite spline evaluation callback for ggml_map_custom1.
+// Evaluates a piecewise-linear spline pointwise on each element of the input tensor.
+// userdata points to a llm_kan_layer_data struct with per-layer coefficients.
+static void kan_spline_eval(struct ggml_tensor * dst, const struct ggml_tensor * a,
+                            int ith, int nth, void * userdata) {
+    const llm_kan_layer_data * data = (const llm_kan_layer_data *)userdata;
+    const float alpha = data->alpha;
+    const float * c = data->coefficients;
+
+    const int64_t n = ggml_nelements(a);
+    const int64_t chunk = (n + nth - 1) / nth;
+    const int64_t start = ith * chunk;
+    const int64_t end = (start + chunk < n) ? start + chunk : n;
+
+    const float * src = (const float *)a->data;
+    float * out = (float *)dst->data;
+
+    for (int64_t i = start; i < end; i++) {
+        float x = src[i];
+        // Map x to grid index: grid spans [-4, 3] with 8 knots, spacing 1.0
+        float x_grid = (x - KAN_GRID_MIN) / KAN_GRID_SPACING;
+        // Clamp to valid range [0, KAN_N_KNOTS-1)
+        if (x_grid < 0.0f) x_grid = 0.0f;
+        if (x_grid > (float)(KAN_N_KNOTS - 1) - 1e-6f) x_grid = (float)(KAN_N_KNOTS - 1) - 1e-6f;
+
+        int idx = (int)x_grid;
+        if (idx >= KAN_N_KNOTS - 1) idx = KAN_N_KNOTS - 2;
+        float frac = x_grid - (float)idx;
+
+        // Linear interpolation between adjacent knots
+        float spline_val = c[idx] * (1.0f - frac) + c[idx + 1] * frac;
+        out[i] = alpha * spline_val;
+    }
+}
+
+void llm_graph_input_attn_bias::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!attn_biases || attn_biases->empty()) return;
+
+    for (int il = 0; il < n_layer; il++) {
+        if (!bias_tensors[il]) continue;
+        int64_t n_kv = bias_n_kv[il];
+        if (n_kv <= 0) continue;
+
+        // Fill with zeros, then add biases from all matching entries
+        std::vector<float> bias_data(n_kv, 0.0f);
+        for (const auto & entry : *attn_biases) {
+            if (il >= entry.layer_start && (entry.layer_end < 0 || il < entry.layer_end)) {
+                int32_t lo = std::max(entry.start_pos, (int32_t)0);
+                int32_t hi = std::min(entry.end_pos, (int32_t)n_kv);
+                for (int32_t pos = lo; pos < hi; pos++) {
+                    bias_data[pos] += entry.bias;
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(bias_tensors[il],
+            bias_data.data(), 0, n_kv * sizeof(float));
+    }
+}
+
 //
 // llm_graph_result
 //
@@ -678,7 +836,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cparams          (params.cparams),
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
-    n_layer          (hparams.n_layer),
+    n_layer          (params.early_exit_layer > 0 && params.early_exit_layer < (int32_t)hparams.n_layer
+                          ? params.early_exit_layer : hparams.n_layer),
+    n_layer_all      (hparams.n_layer),
     n_rot            (hparams.n_rot),
     n_ctx            (cparams.n_ctx),
     n_head           (hparams.n_head()),
@@ -708,12 +868,74 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    head_scales      (params.head_scales),
+    attn_temperatures(params.attn_temperatures),
+    norm_offsets      (params.norm_offsets),
+    attn_biases      (params.attn_biases),
+    kan_coefficients (params.kan_coefficients),
+    kan_alpha        (params.kan_alpha),
+    sparse_masks     (params.sparse_masks),
+    hyper_lora_a     (params.hyper_lora_a),
+    hyper_lora_b     (params.hyper_lora_b),
+    hyper_strength   (params.hyper_strength),
+    hyper_rank       (params.hyper_rank),
+    hyper_layer_start(params.hyper_layer_start),
+    hyper_layer_end  (params.hyper_layer_end),
+    residual_attn_gates(params.residual_attn_gates),
+    residual_ffn_gates (params.residual_ffn_gates),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+
+        // create head intervention input if scales or temperatures are configured
+        bool has_scales = head_scales && !head_scales->empty();
+        bool has_temps  = attn_temperatures && !attn_temperatures->empty();
+        if (has_scales || has_temps) {
+            auto inp = std::make_unique<llm_graph_input_head_intervention>(
+                head_scales, attn_temperatures, (int32_t)n_layer, (int32_t)n_head);
+            head_intervention = (llm_graph_input_head_intervention *) res->add_input(std::move(inp));
+        }
+
+        // create norm offset input if configured (Part G)
+        if (norm_offsets && !norm_offsets->empty()) {
+            auto inp = std::make_unique<llm_graph_input_norm_offsets>(
+                norm_offsets, (int32_t)n_layer, (int32_t)n_embd);
+            norm_intervention = (llm_graph_input_norm_offsets *) res->add_input(std::move(inp));
+        }
+
+        // create attention bias input if configured (Part C)
+        if (attn_biases && !attn_biases->empty()) {
+            auto inp = std::make_unique<llm_graph_input_attn_bias>(
+                attn_biases, (int32_t)n_layer);
+            attn_bias_input = (llm_graph_input_attn_bias *) res->add_input(std::move(inp));
+        }
+
+        // create KAN-lite input if configured (Part P6)
+        if (kan_coefficients && !kan_coefficients->empty() && kan_alpha > 0.0f) {
+            auto inp = std::make_unique<llm_graph_input_kan>(
+                kan_coefficients, kan_alpha, (int32_t)n_layer);
+            kan_input = (llm_graph_input_kan *) res->add_input(std::move(inp));
+        }
+
+        // create sparse mask input if configured (Part P5)
+        if (sparse_masks && !sparse_masks->empty()) {
+            auto inp = std::make_unique<llm_graph_input_sparse_mask>(
+                sparse_masks, (int32_t)n_layer);
+            sparse_mask_input = (llm_graph_input_sparse_mask *) res->add_input(std::move(inp));
+        }
+
+        // create hypernetwork input if configured (Part P4)
+        if (hyper_lora_a && hyper_lora_b && !hyper_lora_a->empty() && hyper_strength != 0.0f
+            && hyper_layer_start >= 0 && hyper_layer_end > hyper_layer_start) {
+            auto inp = std::make_unique<llm_graph_input_hypernetwork>(
+                hyper_lora_a, hyper_lora_b, hyper_strength, hyper_rank,
+                hyper_layer_start, hyper_layer_end, (int32_t)n_embd,
+                (int32_t)hparams.n_ff());
+            hypernetwork_input = (llm_graph_input_hypernetwork *) res->add_input(std::move(inp));
+        }
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -814,6 +1036,21 @@ ggml_tensor * llm_graph_context::build_norm(
         cur = ggml_add(ctx0, cur, mb);
     }
 
+    // Part G: LayerNorm affine shift — add per-layer offset after normalization.
+    // This is the cheapest personality modification: one ggml_add per layer, zero flash-attn penalty.
+    // Only applied when il >= 0 (skip final output norm which uses il = -1).
+    if (norm_intervention && il >= 0 && il < norm_intervention->n_layer) {
+        // Check if this layer actually has offset data (non-empty vector)
+        if (norm_offsets && il < (int)norm_offsets->size() && !(*norm_offsets)[il].empty()) {
+            if (!norm_intervention->offset_tensors[il]) {
+                norm_intervention->offset_tensors[il] = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_embd);
+                ggml_set_input(norm_intervention->offset_tensors[il]);
+                ggml_set_name(norm_intervention->offset_tensors[il], "norm_offset");
+            }
+            cur = ggml_add(ctx0, cur, norm_intervention->offset_tensors[il]);
+        }
+    }
+
     return cur;
 }
 
@@ -832,8 +1069,47 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+    // Save FFN input for hypernetwork LoRA (Part P4) — before up-projection modifies it.
+    ggml_tensor * ffn_input = cur;
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
+
+    // Part P4: Hypernetwork FFN LoRA — rank-4 low-rank delta on up-projection.
+    // delta = B^T @ (A^T @ ffn_input), where A [n_embd, rank], B [rank, n_ff].
+    // ggml_mul_mat(A, x) = A^T @ x, so: ax = A^T @ ffn_input = [rank, n_tokens]
+    //                                     delta = B^T @ ax = [n_ff, n_tokens]
+    if (hypernetwork_input && il >= hypernetwork_input->layer_start && il < hypernetwork_input->layer_end) {
+        int ti = il - hypernetwork_input->layer_start;
+        int32_t r = hypernetwork_input->rank;
+        int32_t ne = hypernetwork_input->n_embd;
+        int32_t nf = hypernetwork_input->n_ff;
+
+        // Create LoRA A tensor lazily: [n_embd, rank]
+        if (!hypernetwork_input->a_tensors[ti]) {
+            hypernetwork_input->a_tensors[ti] = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ne, r);
+            ggml_set_input(hypernetwork_input->a_tensors[ti]);
+            ggml_set_name(hypernetwork_input->a_tensors[ti], "hyper_lora_a");
+        }
+        // Create LoRA B tensor lazily: [rank, n_ff]
+        if (!hypernetwork_input->b_tensors[ti]) {
+            hypernetwork_input->b_tensors[ti] = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, r, nf);
+            ggml_set_input(hypernetwork_input->b_tensors[ti]);
+            ggml_set_name(hypernetwork_input->b_tensors[ti], "hyper_lora_b");
+        }
+
+        // ax = A^T @ ffn_input: [n_embd, rank]^T @ [n_embd, n_tokens] = [rank, n_tokens]
+        ggml_tensor * ax = ggml_mul_mat(ctx0, hypernetwork_input->a_tensors[ti], ffn_input);
+        ggml_set_name(ax, "hyper_ax");
+
+        // delta = B^T @ ax: [rank, n_ff]^T @ [rank, n_tokens] = [n_ff, n_tokens]
+        ggml_tensor * delta = ggml_mul_mat(ctx0, hypernetwork_input->b_tensors[ti], ax);
+        delta = ggml_scale(ctx0, delta, hypernetwork_input->strength);
+        ggml_set_name(delta, "hyper_delta");
+
+        tmp = ggml_add(ctx0, tmp, delta);
+        cb(tmp, "ffn_hyper", il);
+    }
 
     if (up_b) {
         tmp = ggml_add(ctx0, tmp, up_b);
@@ -937,6 +1213,35 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(cur, "ffn_gate_par", il);
     }
 
+    // Part P6: KAN-lite learnable activation overlay.
+    // Adds a piecewise-linear spline residual to the activation output.
+    // spline(x) is evaluated pointwise via ggml_map_custom1, then added to cur.
+    // All coefficients init to 0 → identity (no effect) until tuned by forward-only learning (P7).
+    if (kan_input && il >= 0 && il < kan_input->n_layer && kan_input->layer_data[il].alpha > 0.0f) {
+        ggml_tensor * spline_out = ggml_map_custom1(ctx0, cur, kan_spline_eval,
+                                                     GGML_N_TASKS_MAX,
+                                                     &kan_input->layer_data[il]);
+        ggml_set_name(spline_out, "ffn_kan_spline");
+        cur = ggml_add(ctx0, cur, spline_out);
+        cb(cur, "ffn_kan", il);
+    }
+
+    // Part P5: Dynamic sparse mask — selectively enable/disable FFN neurons.
+    // Applied via ggml_mul with a [n_ff] mask in [0,1]. Broadcasts over n_tokens.
+    // Mask updated periodically (every ~64 tokens) based on activation magnitudes.
+    if (sparse_mask_input && il >= 0 && il < sparse_mask_input->n_layer) {
+        if (sparse_masks && il < (int)sparse_masks->size() && !(*sparse_masks)[il].empty()) {
+            int64_t n_ff = cur->ne[0];
+            if (!sparse_mask_input->mask_tensors[il]) {
+                sparse_mask_input->mask_tensors[il] = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_ff);
+                ggml_set_input(sparse_mask_input->mask_tensors[il]);
+                ggml_set_name(sparse_mask_input->mask_tensors[il], "ffn_sparse_mask");
+            }
+            cur = ggml_mul(ctx0, cur, sparse_mask_input->mask_tensors[il]);
+            cb(cur, "ffn_sparse", il);
+        }
+    }
+
     if (down) {
         cur = build_lora_mm(down, cur);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
@@ -956,6 +1261,14 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (down_s) {
         cur = ggml_mul(ctx0, cur, down_s);
         cb(cur, "ffn_down_s", il);
+    }
+
+    // Gated Residual — scale FFN output before it's added to the residual stream
+    if (residual_ffn_gates && !residual_ffn_gates->empty()
+        && il >= 0 && il < (int)residual_ffn_gates->size()
+        && (*residual_ffn_gates)[il] != 1.0f) {
+        cur = ggml_scale(ctx0, cur, (*residual_ffn_gates)[il]);
+        cb(cur, "ffn_gate", il);
     }
 
     return cur;
@@ -1487,7 +1800,38 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    if (cparams.flash_attn && kq_b == nullptr) {
+    // Per-layer check: only disable flash attention on layers that actually have non-default interventions.
+    // This is critical for mobile perf — flash attn is 2-4x faster + O(1) memory vs O(n²).
+    bool layer_needs_intervention = false;
+    if (head_intervention && il >= 0) {
+        if (head_intervention->head_scales && !head_intervention->head_scales->empty() &&
+            il < (int)head_intervention->head_scales->size()) {
+            for (float s : (*head_intervention->head_scales)[il]) {
+                if (s != 1.0f) { layer_needs_intervention = true; break; }
+            }
+        }
+        if (!layer_needs_intervention &&
+            head_intervention->attn_temperatures && !head_intervention->attn_temperatures->empty() &&
+            il < (int)head_intervention->attn_temperatures->size()) {
+            for (float t : (*head_intervention->attn_temperatures)[il]) {
+                if (t != 1.0f) { layer_needs_intervention = true; break; }
+            }
+        }
+    }
+
+    // Part C: Attention score bias also disables flash attention for affected layers
+    if (!layer_needs_intervention && attn_biases && !attn_biases->empty() && il >= 0) {
+        for (const auto & entry : *attn_biases) {
+            if (il >= entry.layer_start && (entry.layer_end < 0 || il < entry.layer_end)) {
+                layer_needs_intervention = true;
+                break;
+            }
+        }
+    }
+
+    const bool use_flash = cparams.flash_attn && kq_b == nullptr && !layer_needs_intervention;
+
+    if (use_flash) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
         if (v_trans) {
@@ -1563,6 +1907,45 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_plus_kq_b", il);
         }
 
+        // Part C: Attention score bias injection — boost attention to persona/system prompt tokens.
+        // kq shape: [n_kv, n_tokens, n_head, n_stream]
+        // bias_tensor shape: [n_kv] — broadcasts across tokens, heads, and streams.
+        if (layer_needs_intervention && attn_bias_input && attn_biases && !attn_biases->empty() && il >= 0) {
+            bool has_bias_for_layer = false;
+            for (const auto & entry : *attn_biases) {
+                if (il >= entry.layer_start && (entry.layer_end < 0 || il < entry.layer_end)) {
+                    has_bias_for_layer = true;
+                    break;
+                }
+            }
+            if (has_bias_for_layer) {
+                int64_t n_kv = k->ne[1];
+                if (!attn_bias_input->bias_tensors[il]) {
+                    attn_bias_input->bias_tensors[il] = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_kv);
+                    ggml_set_input(attn_bias_input->bias_tensors[il]);
+                    ggml_set_name(attn_bias_input->bias_tensors[il], "attn_score_bias");
+                    attn_bias_input->bias_n_kv[il] = n_kv;
+                }
+                kq = ggml_add(ctx0, kq, attn_bias_input->bias_tensors[il]);
+                cb(kq, "kq_attn_biased", il);
+            }
+        }
+
+        // Part E: Per-head attention temperature — multiply kq by (1/T_h) per head before softmax
+        // kq shape: [n_kv, n_tokens, n_head, n_stream]
+        // Only inject if this specific layer has non-default temperatures
+        if (layer_needs_intervention &&
+            head_intervention && head_intervention->attn_temperatures && !head_intervention->attn_temperatures->empty() &&
+            il >= 0 && il < (int)head_intervention->attn_temperatures->size()) {
+            if (!head_intervention->temp_tensors[il]) {
+                head_intervention->temp_tensors[il] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_head);
+                ggml_set_input(head_intervention->temp_tensors[il]);
+                ggml_set_name(head_intervention->temp_tensors[il], "attn_temp");
+            }
+            kq = ggml_mul(ctx0, kq, head_intervention->temp_tensors[il]);
+            cb(kq, "kq_temp_scaled", il);
+        }
+
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
@@ -1580,6 +1963,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
             cb(kqv, "kqv_mla", il);
+        }
+
+        // Part D: Head rescaling — multiply each head's output by a scalar
+        // kqv shape: [d_head_v, n_tokens, n_head, n_stream]
+        // Only inject if this specific layer has non-default scales
+        if (layer_needs_intervention &&
+            head_intervention && head_intervention->head_scales && !head_intervention->head_scales->empty() &&
+            il >= 0 && il < (int)head_intervention->head_scales->size()) {
+            if (!head_intervention->scale_tensors[il]) {
+                head_intervention->scale_tensors[il] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_head);
+                ggml_set_input(head_intervention->scale_tensors[il]);
+                ggml_set_name(head_intervention->scale_tensors[il], "head_scale");
+            }
+            kqv = ggml_mul(ctx0, kqv, head_intervention->scale_tensors[il]);
+            cb(kqv, "kqv_head_scaled", il);
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
@@ -1666,6 +2064,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    // Gated Residual — scale attention output before it's added to the residual stream
+    if (residual_attn_gates && !residual_attn_gates->empty()
+        && il >= 0 && il < (int)residual_attn_gates->size()
+        && (*residual_attn_gates)[il] != 1.0f) {
+        cur = ggml_scale(ctx0, cur, (*residual_attn_gates)[il]);
+        cb(cur, "attn_gate", il);
     }
 
     return cur;
@@ -1758,6 +2164,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Gated Residual — scale attention output before it's added to the residual stream
+    if (residual_attn_gates && !residual_attn_gates->empty()
+        && il >= 0 && il < (int)residual_attn_gates->size()
+        && (*residual_attn_gates)[il] != 1.0f) {
+        cur = ggml_scale(ctx0, cur, (*residual_attn_gates)[il]);
+        cb(cur, "attn_gate", il);
+    }
+
     return cur;
 }
 
@@ -1825,6 +2239,14 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_add(ctx0, cur, wo_b);
     }
 
+    // Gated Residual — scale attention output before it's added to the residual stream
+    if (residual_attn_gates && !residual_attn_gates->empty()
+        && il >= 0 && il < (int)residual_attn_gates->size()
+        && (*residual_attn_gates)[il] != 1.0f) {
+        cur = ggml_scale(ctx0, cur, (*residual_attn_gates)[il]);
+        cb(cur, "attn_gate", il);
+    }
+
     return cur;
 }
 
@@ -1878,6 +2300,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    // Gated Residual — scale attention output before it's added to the residual stream
+    if (residual_attn_gates && !residual_attn_gates->empty()
+        && il >= 0 && il < (int)residual_attn_gates->size()
+        && (*residual_attn_gates)[il] != 1.0f) {
+        cur = ggml_scale(ctx0, cur, (*residual_attn_gates)[il]);
+        cb(cur, "attn_gate", il);
     }
 
     return cur;

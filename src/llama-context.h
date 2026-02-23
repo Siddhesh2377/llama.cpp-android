@@ -264,6 +264,66 @@ private:
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
 
+public:
+    // === Runtime Behavior Intervention State ===
+    // These are public because the C API functions (llama_set_head_scale, etc.)
+    // access them directly. They are not part of the normal llama.cpp API surface.
+
+    // Part A: Activation capture for runtime control vector computation
+    bool capture_layer_outputs = false;
+    std::vector<std::vector<float>> captured_layer_data; // [n_layers][n_embd]
+
+    // Gated Residual — per-layer scalar gate on attention and FFN outputs.
+    // Default empty = all 1.0 (no change). Values in [0, 2]: 0=skip, 1=default, 2=amplify.
+    std::vector<float> residual_attn_gates;  // [n_layer] or empty
+    std::vector<float> residual_ffn_gates;   // [n_layer] or empty
+
+    // Speculative decoding: early exit layer (-1 = disabled).
+    // When > 0, graph builders loop over min(n_layer, early_exit_layer) layers.
+    int32_t early_exit_layer = -1;
+
+    // Part C: Attention score bias injection (struct defined in llama-graph.h)
+    std::vector<llm_attn_bias_entry> attn_biases;
+
+    // Part D: Head rescaling — per-head scalar multiplier
+    // Empty = no rescaling (all 1.0). Outer size = n_layer, inner size = n_head.
+    std::vector<std::vector<float>> head_scales;
+
+    // Part E: Attention temperature — per-head softmax temperature
+    // Empty = no temperature override (all 1.0). Outer size = n_layer, inner size = n_head.
+    std::vector<std::vector<float>> attn_temperatures;
+
+    // Part G: LayerNorm affine shift — per-layer additive offset after normalization
+    // Empty = no offset. Outer size = n_layer, inner size = n_embd.
+    std::vector<std::vector<float>> norm_offsets;
+
+    // Part P5: Dynamic sparse masks — per-layer FFN neuron masks
+    // Values in [0, 1]: 0 = neuron disabled, 1 = fully active.
+    // Empty = no masking (all neurons active). Outer size = n_layer, inner size = n_ff.
+    std::vector<std::vector<float>> sparse_masks;
+
+    // Part P6: KAN-lite learnable activation overlay
+    // Piecewise-linear spline coefficients: [n_layer][KAN_N_KNOTS].
+    // Init to 0 = identity (no modification to base activation).
+    // Tuned by forward-only learning (P7) to improve activation functions.
+    std::vector<std::vector<float>> kan_coefficients;
+    float kan_alpha = 0.0f;  // global strength multiplier (0 = disabled)
+
+    // Part P4: Hypernetwork — per-target-layer FFN LoRA
+    // Low-rank adaptation of FFN up-projection for middle layers.
+    // lora_a[i]: [rank * n_embd] floats, stored column-major for ggml [n_embd, rank]
+    // lora_b[i]: [n_ff * rank] floats, stored column-major for ggml [rank, n_ff]
+    // Index i is relative to layer_start (i.e., i = layer - hyper_layer_start).
+    struct {
+        bool active = false;
+        float strength = 0.0f;
+        int32_t rank = 4;
+        int32_t layer_start = -1;   // -1 = auto (37% depth)
+        int32_t layer_end = -1;     // -1 = auto (70% depth)
+        std::vector<std::vector<float>> lora_a;  // [n_target_layers][rank * n_embd]
+        std::vector<std::vector<float>> lora_b;  // [n_target_layers][n_ff * rank]
+    } hypernetwork;
+
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;

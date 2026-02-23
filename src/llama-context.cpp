@@ -8,10 +8,13 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 
 //
@@ -1180,6 +1183,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // Part A: extract per-layer hidden states if capture is enabled
+    if (capture_layer_outputs) {
+        auto * gf = res->get_gf();
+        const int n_l = model.hparams.n_layer;
+        const int n_e = model.hparams.n_embd;
+
+        captured_layer_data.resize(n_l);
+
+        for (int il = 0; il < n_l; il++) {
+            char tname[64];
+            snprintf(tname, sizeof(tname), "l_out-%d", il);
+
+            ggml_tensor * node = ggml_graph_get_tensor(gf, tname);
+            if (node) {
+                captured_layer_data[il].resize(n_e);
+                // extract the last token's hidden state
+                const int64_t n_tokens_in_tensor = node->ne[1];
+                const size_t offset = (n_tokens_in_tensor - 1) * n_e * sizeof(float);
+                ggml_backend_tensor_get(node, captured_layer_data[il].data(), offset, n_e * sizeof(float));
+            }
+        }
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2125,11 +2151,27 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ &cvec,
-        /*.loras       =*/ &loras,
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
+        /*.cvec              =*/ &cvec,
+        /*.loras             =*/ &loras,
+        /*.mctx              =*/ mctx,
+        /*.cross             =*/ &cross,
+        /*.head_scales       =*/ &head_scales,
+        /*.attn_temperatures =*/ &attn_temperatures,
+        /*.norm_offsets       =*/ &norm_offsets,
+        /*.attn_biases        =*/ &attn_biases,
+        /*.kan_coefficients   =*/ &kan_coefficients,
+        /*.kan_alpha          =*/ kan_alpha,
+        /*.sparse_masks       =*/ &sparse_masks,
+        /*.hyper_lora_a       =*/ &hypernetwork.lora_a,
+        /*.hyper_lora_b       =*/ &hypernetwork.lora_b,
+        /*.hyper_strength     =*/ hypernetwork.strength,
+        /*.hyper_rank         =*/ hypernetwork.rank,
+        /*.hyper_layer_start  =*/ hypernetwork.layer_start,
+        /*.hyper_layer_end    =*/ hypernetwork.layer_end,
+        /*.residual_attn_gates =*/ &residual_attn_gates,
+        /*.residual_ffn_gates  =*/ &residual_ffn_gates,
+        /*.early_exit_layer    =*/ early_exit_layer,
+        /*.samplers          =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2171,6 +2213,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // Part A: mark layer output tensors for preservation when capture is enabled
+        if (capture_layer_outputs && il >= 0 && strcmp(name, "l_out") == 0) {
+            ggml_set_output(cur);
         }
 
         if (!cparams.offload_kqv) {
@@ -3282,6 +3329,695 @@ int32_t llama_apply_adapter_cvec(
     bool res = ctx->apply_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
+}
+
+//
+// Runtime Behavior Intervention API
+//
+
+// Part A: Activation capture
+void llama_set_capture_layer_outputs(llama_context * ctx, bool enabled) {
+    ctx->capture_layer_outputs = enabled;
+    if (!enabled) {
+        ctx->captured_layer_data.clear();
+    }
+}
+
+int32_t llama_get_n_captured_layers(llama_context * ctx) {
+    return (int32_t) ctx->captured_layer_data.size();
+}
+
+const float * llama_get_captured_layer_output(llama_context * ctx, int32_t layer_id) {
+    if (layer_id < 0 || layer_id >= (int32_t) ctx->captured_layer_data.size()) {
+        return nullptr;
+    }
+    if (ctx->captured_layer_data[layer_id].empty()) {
+        return nullptr;
+    }
+    return ctx->captured_layer_data[layer_id].data();
+}
+
+// Part C: Attention score bias
+int32_t llama_set_attention_bias(
+        llama_context * ctx,
+                     int32_t   start_pos,
+                     int32_t   end_pos,
+                       float   bias,
+                     int32_t   layer_start,
+                     int32_t   layer_end) {
+    ctx->attn_biases.push_back({start_pos, end_pos, bias, layer_start, layer_end});
+    return 0;
+}
+
+void llama_clear_attention_bias(llama_context * ctx) {
+    ctx->attn_biases.clear();
+}
+
+// Part D: Head rescaling
+int32_t llama_set_head_scale(
+        llama_context * ctx,
+                     int32_t   layer,
+                     int32_t   head,
+                       float   scale) {
+    const int n_layer = ctx->get_model().hparams.n_layer;
+    const int n_head  = ctx->get_model().hparams.n_head();
+
+    if (layer < 0 || layer >= n_layer || head < 0 || head >= n_head) {
+        return -1;
+    }
+
+    // lazy init
+    if (ctx->head_scales.empty()) {
+        ctx->head_scales.resize(n_layer);
+        for (auto & v : ctx->head_scales) {
+            v.assign(n_head, 1.0f);
+        }
+    }
+
+    ctx->head_scales[layer][head] = scale;
+    return 0;
+}
+
+void llama_reset_head_scales(llama_context * ctx) {
+    ctx->head_scales.clear();
+}
+
+// Part E: Attention temperature
+int32_t llama_set_attention_temperature(
+        llama_context * ctx,
+                     int32_t   layer,
+                     int32_t   head,
+                       float   temperature) {
+    const int n_layer = ctx->get_model().hparams.n_layer;
+    const int n_head  = ctx->get_model().hparams.n_head();
+
+    if (layer < 0 || layer >= n_layer || head < 0 || head >= n_head) {
+        return -1;
+    }
+    if (temperature <= 0.0f) {
+        return -1;
+    }
+
+    // lazy init
+    if (ctx->attn_temperatures.empty()) {
+        ctx->attn_temperatures.resize(n_layer);
+        for (auto & v : ctx->attn_temperatures) {
+            v.assign(n_head, 1.0f);
+        }
+    }
+
+    ctx->attn_temperatures[layer][head] = temperature;
+    return 0;
+}
+
+void llama_reset_attention_temperatures(llama_context * ctx) {
+    ctx->attn_temperatures.clear();
+}
+
+// Gated Residual — per-layer scalar gates on attention and FFN outputs
+int32_t llama_set_residual_gates(
+        llama_context * ctx,
+        const float * attn_gates,
+        const float * ffn_gates,
+        int32_t n_layer) {
+    const int nl = ctx->get_model().hparams.n_layer;
+    if (n_layer != nl) return -1;
+
+    if (attn_gates) {
+        ctx->residual_attn_gates.assign(attn_gates, attn_gates + nl);
+    } else {
+        ctx->residual_attn_gates.clear();
+    }
+
+    if (ffn_gates) {
+        ctx->residual_ffn_gates.assign(ffn_gates, ffn_gates + nl);
+    } else {
+        ctx->residual_ffn_gates.clear();
+    }
+
+    return 0;
+}
+
+void llama_reset_residual_gates(llama_context * ctx) {
+    ctx->residual_attn_gates.clear();
+    ctx->residual_ffn_gates.clear();
+}
+
+// Speculative decoding: early exit layer
+int32_t llama_set_early_exit_layer(llama_context * ctx, int32_t layer) {
+    const int nl = (int)ctx->get_model().hparams.n_layer;
+    if (layer <= 0 || layer > nl) {
+        ctx->early_exit_layer = -1;  // disabled
+        return -1;
+    }
+    ctx->early_exit_layer = layer;
+    return 0;
+}
+
+void llama_reset_early_exit_layer(llama_context * ctx) {
+    ctx->early_exit_layer = -1;
+}
+
+// Part G: LayerNorm affine shift
+int32_t llama_set_norm_offsets(llama_context * ctx, int32_t layer, const float * offsets, int32_t n_embd) {
+    const int nl = ctx->get_model().hparams.n_layer;
+    const int ne = ctx->get_model().hparams.n_embd;
+    if (layer < 0 || layer >= nl || n_embd != ne || !offsets) return -1;
+
+    if (ctx->norm_offsets.empty()) {
+        ctx->norm_offsets.resize(nl);
+    }
+    ctx->norm_offsets[layer].assign(offsets, offsets + n_embd);
+    return 0;
+}
+
+void llama_reset_norm_offsets(llama_context * ctx) {
+    ctx->norm_offsets.clear();
+}
+
+// Intervention state persistence — save/load learnable parameters
+static constexpr uint32_t LINT_MAGIC   = 0x544E494C; // "LINT"
+static constexpr uint32_t LINT_VERSION = 1;
+static constexpr uint8_t  LINT_TAG_END    = 0;
+static constexpr uint8_t  LINT_TAG_KAN    = 1;
+static constexpr uint8_t  LINT_TAG_SPARSE = 2;
+static constexpr uint8_t  LINT_TAG_HYPER  = 3;
+
+int32_t llama_save_intervention_state(llama_context * ctx, const char * path) {
+    if (!ctx || !path) return -1;
+
+    FILE * fp = fopen(path, "wb");
+    if (!fp) {
+        LLAMA_LOG_ERROR("%s: failed to open %s for writing\n", __func__, path);
+        return -1;
+    }
+
+    const int nl = ctx->get_model().hparams.n_layer;
+
+    // Header
+    fwrite(&LINT_MAGIC,   sizeof(uint32_t), 1, fp);
+    fwrite(&LINT_VERSION, sizeof(uint32_t), 1, fp);
+    uint32_t n_layer = (uint32_t)nl;
+    fwrite(&n_layer, sizeof(uint32_t), 1, fp);
+
+    // Section: KAN coefficients
+    if (!ctx->kan_coefficients.empty() && ctx->kan_alpha > 0.0f) {
+        uint8_t tag = LINT_TAG_KAN;
+        fwrite(&tag, 1, 1, fp);
+        fwrite(&ctx->kan_alpha, sizeof(float), 1, fp);
+        int32_t n_knots = KAN_N_KNOTS;
+        fwrite(&n_knots, sizeof(int32_t), 1, fp);
+        for (int il = 0; il < nl; il++) {
+            if (il < (int)ctx->kan_coefficients.size() && (int)ctx->kan_coefficients[il].size() == KAN_N_KNOTS) {
+                fwrite(ctx->kan_coefficients[il].data(), sizeof(float), KAN_N_KNOTS, fp);
+            } else {
+                float zeros[KAN_N_KNOTS] = {};
+                fwrite(zeros, sizeof(float), KAN_N_KNOTS, fp);
+            }
+        }
+    }
+
+    // Section: Sparse masks
+    if (!ctx->sparse_masks.empty()) {
+        uint8_t tag = LINT_TAG_SPARSE;
+        fwrite(&tag, 1, 1, fp);
+        int32_t n_entries = 0;
+        for (int il = 0; il < nl; il++) {
+            if (il < (int)ctx->sparse_masks.size() && !ctx->sparse_masks[il].empty()) n_entries++;
+        }
+        fwrite(&n_entries, sizeof(int32_t), 1, fp);
+        for (int il = 0; il < nl; il++) {
+            if (il < (int)ctx->sparse_masks.size() && !ctx->sparse_masks[il].empty()) {
+                int32_t layer_idx = il;
+                int32_t n_ff = (int32_t)ctx->sparse_masks[il].size();
+                fwrite(&layer_idx, sizeof(int32_t), 1, fp);
+                fwrite(&n_ff, sizeof(int32_t), 1, fp);
+                fwrite(ctx->sparse_masks[il].data(), sizeof(float), n_ff, fp);
+            }
+        }
+    }
+
+    // Section: Hypernetwork LoRA (Part P4)
+    if (ctx->hypernetwork.active && !ctx->hypernetwork.lora_a.empty()) {
+        uint8_t tag = LINT_TAG_HYPER;
+        fwrite(&tag, 1, 1, fp);
+        fwrite(&ctx->hypernetwork.rank, sizeof(int32_t), 1, fp);
+        fwrite(&ctx->hypernetwork.layer_start, sizeof(int32_t), 1, fp);
+        fwrite(&ctx->hypernetwork.layer_end, sizeof(int32_t), 1, fp);
+        fwrite(&ctx->hypernetwork.strength, sizeof(float), 1, fp);
+        int32_t n_target = (int32_t)ctx->hypernetwork.lora_a.size();
+        fwrite(&n_target, sizeof(int32_t), 1, fp);
+        for (int ti = 0; ti < n_target; ti++) {
+            int32_t a_size = (int32_t)ctx->hypernetwork.lora_a[ti].size();
+            int32_t b_size = (int32_t)ctx->hypernetwork.lora_b[ti].size();
+            fwrite(&a_size, sizeof(int32_t), 1, fp);
+            fwrite(&b_size, sizeof(int32_t), 1, fp);
+            if (a_size > 0) fwrite(ctx->hypernetwork.lora_a[ti].data(), sizeof(float), a_size, fp);
+            if (b_size > 0) fwrite(ctx->hypernetwork.lora_b[ti].data(), sizeof(float), b_size, fp);
+        }
+    }
+
+    // End marker
+    uint8_t end_tag = LINT_TAG_END;
+    fwrite(&end_tag, 1, 1, fp);
+
+    fclose(fp);
+    LLAMA_LOG_INFO("%s: saved intervention state to %s\n", __func__, path);
+    return 0;
+}
+
+int32_t llama_load_intervention_state(llama_context * ctx, const char * path) {
+    if (!ctx || !path) return -1;
+
+    FILE * fp = fopen(path, "rb");
+    if (!fp) {
+        LLAMA_LOG_WARN("%s: no intervention state at %s (first run)\n", __func__, path);
+        return -2; // not found (not an error — first run)
+    }
+
+    uint32_t magic, version, n_layer_file;
+    if (fread(&magic, sizeof(uint32_t), 1, fp) != 1 || magic != LINT_MAGIC) {
+        LLAMA_LOG_ERROR("%s: invalid magic in %s\n", __func__, path);
+        fclose(fp);
+        return -1;
+    }
+    if (fread(&version, sizeof(uint32_t), 1, fp) != 1 || version > LINT_VERSION) {
+        LLAMA_LOG_ERROR("%s: unsupported version %u in %s\n", __func__, version, path);
+        fclose(fp);
+        return -1;
+    }
+    if (fread(&n_layer_file, sizeof(uint32_t), 1, fp) != 1) {
+        fclose(fp);
+        return -1;
+    }
+
+    const int nl = ctx->get_model().hparams.n_layer;
+    if ((int)n_layer_file != nl) {
+        LLAMA_LOG_WARN("%s: layer count mismatch (file=%u, model=%d), skipping\n",
+                       __func__, n_layer_file, nl);
+        fclose(fp);
+        return -3; // model mismatch
+    }
+
+    // Read sections
+    while (true) {
+        uint8_t tag;
+        if (fread(&tag, 1, 1, fp) != 1) break;
+        if (tag == LINT_TAG_END) break;
+
+        if (tag == LINT_TAG_KAN) {
+            float alpha;
+            int32_t n_knots;
+            if (fread(&alpha, sizeof(float), 1, fp) != 1) break;
+            if (fread(&n_knots, sizeof(int32_t), 1, fp) != 1) break;
+            if (n_knots != KAN_N_KNOTS) {
+                LLAMA_LOG_WARN("%s: KAN knot count mismatch (file=%d, expected=%d)\n",
+                               __func__, n_knots, KAN_N_KNOTS);
+                // Skip the data
+                fseek(fp, nl * n_knots * sizeof(float), SEEK_CUR);
+                continue;
+            }
+            ctx->kan_alpha = alpha;
+            ctx->kan_coefficients.resize(nl);
+            for (int il = 0; il < nl; il++) {
+                ctx->kan_coefficients[il].resize(KAN_N_KNOTS);
+                if (fread(ctx->kan_coefficients[il].data(), sizeof(float), KAN_N_KNOTS, fp) != (size_t)KAN_N_KNOTS) {
+                    break;
+                }
+            }
+            LLAMA_LOG_INFO("%s: loaded KAN coefficients (alpha=%.3f, %d layers)\n",
+                           __func__, alpha, nl);
+
+        } else if (tag == LINT_TAG_SPARSE) {
+            int32_t n_entries;
+            if (fread(&n_entries, sizeof(int32_t), 1, fp) != 1) break;
+            if (ctx->sparse_masks.empty()) {
+                ctx->sparse_masks.resize(nl);
+            }
+            for (int i = 0; i < n_entries; i++) {
+                int32_t layer_idx, n_ff;
+                if (fread(&layer_idx, sizeof(int32_t), 1, fp) != 1) break;
+                if (fread(&n_ff, sizeof(int32_t), 1, fp) != 1) break;
+                if (layer_idx >= 0 && layer_idx < nl && n_ff > 0) {
+                    ctx->sparse_masks[layer_idx].resize(n_ff);
+                    if (fread(ctx->sparse_masks[layer_idx].data(), sizeof(float), n_ff, fp) != (size_t)n_ff) {
+                        break;
+                    }
+                } else {
+                    fseek(fp, n_ff * sizeof(float), SEEK_CUR);
+                }
+            }
+            LLAMA_LOG_INFO("%s: loaded sparse masks (%d entries)\n", __func__, n_entries);
+
+        } else if (tag == LINT_TAG_HYPER) {
+            int32_t rank, layer_start, layer_end, n_target;
+            float strength;
+            if (fread(&rank, sizeof(int32_t), 1, fp) != 1) break;
+            if (fread(&layer_start, sizeof(int32_t), 1, fp) != 1) break;
+            if (fread(&layer_end, sizeof(int32_t), 1, fp) != 1) break;
+            if (fread(&strength, sizeof(float), 1, fp) != 1) break;
+            if (fread(&n_target, sizeof(int32_t), 1, fp) != 1) break;
+
+            if (layer_end > nl || layer_start < 0 || n_target <= 0 || rank <= 0) {
+                LLAMA_LOG_WARN("%s: invalid hypernetwork params, skipping\n", __func__);
+                // Try to skip the data
+                for (int ti = 0; ti < n_target; ti++) {
+                    int32_t a_size, b_size;
+                    if (fread(&a_size, sizeof(int32_t), 1, fp) != 1) break;
+                    if (fread(&b_size, sizeof(int32_t), 1, fp) != 1) break;
+                    fseek(fp, (a_size + b_size) * sizeof(float), SEEK_CUR);
+                }
+                continue;
+            }
+
+            ctx->hypernetwork.active = true;
+            ctx->hypernetwork.rank = rank;
+            ctx->hypernetwork.layer_start = layer_start;
+            ctx->hypernetwork.layer_end = layer_end;
+            ctx->hypernetwork.strength = strength;
+            ctx->hypernetwork.lora_a.resize(n_target);
+            ctx->hypernetwork.lora_b.resize(n_target);
+
+            for (int ti = 0; ti < n_target; ti++) {
+                int32_t a_size, b_size;
+                if (fread(&a_size, sizeof(int32_t), 1, fp) != 1) break;
+                if (fread(&b_size, sizeof(int32_t), 1, fp) != 1) break;
+                if (a_size > 0) {
+                    ctx->hypernetwork.lora_a[ti].resize(a_size);
+                    if (fread(ctx->hypernetwork.lora_a[ti].data(), sizeof(float), a_size, fp) != (size_t)a_size) break;
+                }
+                if (b_size > 0) {
+                    ctx->hypernetwork.lora_b[ti].resize(b_size);
+                    if (fread(ctx->hypernetwork.lora_b[ti].data(), sizeof(float), b_size, fp) != (size_t)b_size) break;
+                }
+            }
+            LLAMA_LOG_INFO("%s: loaded hypernetwork (rank=%d, layers [%d,%d), strength=%.2f, %d targets)\n",
+                           __func__, rank, layer_start, layer_end, strength, n_target);
+
+        } else {
+            LLAMA_LOG_WARN("%s: unknown section tag %d, stopping\n", __func__, tag);
+            break;
+        }
+    }
+
+    fclose(fp);
+    LLAMA_LOG_INFO("%s: loaded intervention state from %s\n", __func__, path);
+    return 0;
+}
+
+// Part P5: Dynamic sparse masks
+int32_t llama_set_sparse_mask(llama_context * ctx, int32_t layer,
+                               const float * mask, int32_t n_ff) {
+    const int nl = ctx->get_model().hparams.n_layer;
+    const int expected_nff = ctx->get_model().hparams.n_ff(layer);
+    if (layer < 0 || layer >= nl || !mask || n_ff != expected_nff) return -1;
+
+    if ((int)ctx->sparse_masks.size() != nl) {
+        ctx->sparse_masks.resize(nl);
+    }
+    ctx->sparse_masks[layer].assign(mask, mask + n_ff);
+    return 0;
+}
+
+int32_t llama_init_sparse_masks(llama_context * ctx, float keep_ratio) {
+    const int nl = ctx->get_model().hparams.n_layer;
+    ctx->sparse_masks.resize(nl);
+
+    for (int il = 0; il < nl; il++) {
+        int n_ff = ctx->get_model().hparams.n_ff(il);
+        ctx->sparse_masks[il].assign(n_ff, 1.0f); // all neurons active
+    }
+
+    // If keep_ratio < 1.0, apply initial sparsification based on uniform random
+    // (real sparsification is done later via nativeUpdateSparseMasks with activation data)
+    if (keep_ratio < 1.0f && keep_ratio > 0.0f) {
+        std::mt19937 rng(42); // deterministic seed for reproducibility
+        for (int il = 0; il < nl; il++) {
+            int n_ff = (int)ctx->sparse_masks[il].size();
+            int n_keep = (int)(n_ff * keep_ratio);
+
+            // Create sorted indices by random priority
+            std::vector<int> indices(n_ff);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::shuffle(indices.begin(), indices.end(), rng);
+
+            // Mask out neurons beyond keep count
+            for (int i = n_keep; i < n_ff; i++) {
+                ctx->sparse_masks[il][indices[i]] = 0.0f;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void llama_reset_sparse_masks(llama_context * ctx) {
+    ctx->sparse_masks.clear();
+}
+
+// Part P6: KAN-lite learnable activation overlay
+int32_t llama_set_kan_coefficients(llama_context * ctx, int32_t layer,
+                                    const float * coefficients, int32_t n_knots) {
+    const int nl = ctx->get_model().hparams.n_layer;
+    if (layer < 0 || layer >= nl || !coefficients || n_knots != KAN_N_KNOTS) return -1;
+
+    if ((int)ctx->kan_coefficients.size() != nl) {
+        ctx->kan_coefficients.resize(nl);
+        for (auto & v : ctx->kan_coefficients) {
+            v.assign(KAN_N_KNOTS, 0.0f);
+        }
+    }
+    ctx->kan_coefficients[layer].assign(coefficients, coefficients + KAN_N_KNOTS);
+    return 0;
+}
+
+void llama_set_kan_alpha(llama_context * ctx, float alpha) {
+    ctx->kan_alpha = alpha;
+}
+
+void llama_reset_kan(llama_context * ctx) {
+    ctx->kan_coefficients.clear();
+    ctx->kan_alpha = 0.0f;
+}
+
+// Part P4: Hypernetwork — per-target-layer FFN LoRA
+int32_t llama_init_hypernetwork(llama_context * ctx, int32_t rank,
+                                  int32_t layer_start, int32_t layer_end,
+                                  float strength) {
+    if (!ctx || rank <= 0) return -1;
+
+    const int nl = ctx->get_model().hparams.n_layer;
+    const int ne = ctx->get_model().hparams.n_embd;
+
+    // Auto-compute layer range if not specified: middle ~33% of layers
+    if (layer_start < 0) layer_start = (int32_t)(nl * 0.37f);
+    if (layer_end <= 0)  layer_end   = (int32_t)(nl * 0.70f);
+    if (layer_start >= layer_end || layer_end > nl) return -1;
+
+    int n_target = layer_end - layer_start;
+
+    ctx->hypernetwork.active = true;
+    ctx->hypernetwork.strength = strength;
+    ctx->hypernetwork.rank = rank;
+    ctx->hypernetwork.layer_start = layer_start;
+    ctx->hypernetwork.layer_end = layer_end;
+    ctx->hypernetwork.lora_a.resize(n_target);
+    ctx->hypernetwork.lora_b.resize(n_target);
+
+    // Initialize: A with small random values, B with zeros (net effect = zero initially)
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(0.0f, 0.01f);
+
+    for (int ti = 0; ti < n_target; ti++) {
+        int il = layer_start + ti;
+        int n_ff = ctx->get_model().hparams.n_ff(il);
+
+        ctx->hypernetwork.lora_a[ti].resize(rank * ne);
+        ctx->hypernetwork.lora_b[ti].resize(n_ff * rank, 0.0f); // zeros = no initial effect
+
+        for (int i = 0; i < rank * ne; i++) {
+            ctx->hypernetwork.lora_a[ti][i] = dist(rng);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: initialized hypernetwork: rank=%d, layers [%d, %d), strength=%.2f, %d target layers\n",
+                   __func__, rank, layer_start, layer_end, strength, n_target);
+    return 0;
+}
+
+int32_t llama_set_hypernetwork_lora(llama_context * ctx, int32_t target_idx,
+                                       const float * a, int32_t a_size,
+                                       const float * b, int32_t b_size) {
+    if (!ctx || !ctx->hypernetwork.active) return -1;
+    int n_target = ctx->hypernetwork.layer_end - ctx->hypernetwork.layer_start;
+    if (target_idx < 0 || target_idx >= n_target) return -1;
+
+    int32_t rank = ctx->hypernetwork.rank;
+    int ne = ctx->get_model().hparams.n_embd;
+    int il = ctx->hypernetwork.layer_start + target_idx;
+    int n_ff = ctx->get_model().hparams.n_ff(il);
+
+    if (a && a_size == rank * ne) {
+        ctx->hypernetwork.lora_a[target_idx].assign(a, a + a_size);
+    }
+    if (b && b_size == n_ff * rank) {
+        ctx->hypernetwork.lora_b[target_idx].assign(b, b + b_size);
+    }
+    return 0;
+}
+
+void llama_set_hypernetwork_strength(llama_context * ctx, float strength) {
+    if (ctx) ctx->hypernetwork.strength = strength;
+}
+
+void llama_reset_hypernetwork(llama_context * ctx) {
+    if (!ctx) return;
+    ctx->hypernetwork.active = false;
+    ctx->hypernetwork.strength = 0.0f;
+    ctx->hypernetwork.rank = 4;
+    ctx->hypernetwork.layer_start = -1;
+    ctx->hypernetwork.layer_end = -1;
+    ctx->hypernetwork.lora_a.clear();
+    ctx->hypernetwork.lora_b.clear();
+}
+
+// Part P7: Forward-only learning via SPSA (Simultaneous Perturbation Stochastic Approximation).
+// Runs 2 forward passes with perturbed KAN coefficients on a probe context,
+// estimates gradient, and updates the main context's KAN coefficients.
+// Returns estimated loss improvement (positive = better). 0 if nothing to do.
+float llama_forward_learn_step(llama_context * ctx,
+                                const llama_token * tokens,
+                                int32_t n_tokens,
+                                float learning_rate,
+                                float noise_scale) {
+    if (n_tokens < 2 || ctx->kan_coefficients.empty() || ctx->kan_alpha <= 0.0f) {
+        return 0.0f;
+    }
+
+    const int n_layer = (int)ctx->get_model().hparams.n_layer;
+    const int n_params = n_layer * KAN_N_KNOTS;
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx->get_model());
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    // --- Create probe context (shares model weights, tiny KV cache) ---
+    llama_context_params probe_cparams = llama_context_default_params();
+    probe_cparams.n_ctx = n_tokens + 4;
+    probe_cparams.n_batch = n_tokens;
+    probe_cparams.n_ubatch = n_tokens;
+    probe_cparams.n_threads = 2;
+    probe_cparams.n_threads_batch = 2;
+    probe_cparams.no_perf = true;
+
+    llama_context * probe = llama_init_from_model(const_cast<llama_model*>(&ctx->get_model()), probe_cparams);
+    if (!probe) {
+        LLAMA_LOG_ERROR("%s: failed to create probe context\n", __func__);
+        return 0.0f;
+    }
+
+    // --- Flatten current KAN params ---
+    std::vector<float> params_flat(n_params);
+    for (int il = 0; il < n_layer; il++) {
+        for (int k = 0; k < KAN_N_KNOTS; k++) {
+            params_flat[il * KAN_N_KNOTS + k] = ctx->kan_coefficients[il][k];
+        }
+    }
+
+    // --- Generate SPSA Bernoulli ±1 perturbation ---
+    std::mt19937 rng(std::random_device{}());
+    std::bernoulli_distribution coin(0.5);
+    std::vector<float> delta(n_params);
+    for (int i = 0; i < n_params; i++) {
+        delta[i] = coin(rng) ? 1.0f : -1.0f;
+    }
+
+    // --- Helper: set KAN params on probe context ---
+    auto set_kan_on_probe = [&](const std::vector<float> & flat) {
+        for (int il = 0; il < n_layer; il++) {
+            llama_set_kan_coefficients(probe, il, &flat[il * KAN_N_KNOTS], KAN_N_KNOTS);
+        }
+        llama_set_kan_alpha(probe, ctx->kan_alpha);
+    };
+
+    // --- Helper: evaluate cross-entropy loss on probe context ---
+    auto eval_loss = [&]() -> float {
+        // Clear memory for fresh eval
+        llama_memory_clear(llama_get_memory(probe), true);
+
+        // Create batch requesting logits for positions 0..n_tokens-2
+        // (to predict tokens 1..n_tokens-1)
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (int i = 0; i < n_tokens; i++) {
+            batch.token[i] = tokens[i];
+            batch.pos[i] = i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = (i < n_tokens - 1) ? 1 : 0;
+        }
+        batch.n_tokens = n_tokens;
+
+        int rc = llama_decode(probe, batch);
+        llama_batch_free(batch);
+        if (rc != 0) return 1e6f;
+
+        // Compute mean cross-entropy loss
+        float loss = 0.0f;
+        int count = 0;
+        for (int i = 0; i < n_tokens - 1; i++) {
+            float * logits = llama_get_logits_ith(probe, i);
+            if (!logits) continue;
+
+            // Log-sum-exp for numerical stability
+            float max_l = logits[0];
+            for (int v = 1; v < n_vocab; v++) {
+                if (logits[v] > max_l) max_l = logits[v];
+            }
+            float sum_exp = 0.0f;
+            for (int v = 0; v < n_vocab; v++) {
+                sum_exp += expf(logits[v] - max_l);
+            }
+            float log_prob = (logits[tokens[i + 1]] - max_l) - logf(sum_exp);
+            loss -= log_prob;
+            count++;
+        }
+
+        return (count > 0) ? loss / (float)count : 0.0f;
+    };
+
+    // --- Positive perturbation: θ + c×Δ ---
+    std::vector<float> params_plus(n_params);
+    for (int i = 0; i < n_params; i++) {
+        params_plus[i] = params_flat[i] + noise_scale * delta[i];
+    }
+    set_kan_on_probe(params_plus);
+    float loss_plus = eval_loss();
+
+    // --- Negative perturbation: θ - c×Δ ---
+    std::vector<float> params_minus(n_params);
+    for (int i = 0; i < n_params; i++) {
+        params_minus[i] = params_flat[i] - noise_scale * delta[i];
+    }
+    set_kan_on_probe(params_minus);
+    float loss_minus = eval_loss();
+
+    // --- Free probe context ---
+    llama_free(probe);
+
+    // --- SPSA gradient estimate: g_i = (L+ - L-) / (2c * Δ_i) ---
+    // Update: θ_new = θ - η × g
+    float loss_diff = loss_plus - loss_minus;
+    for (int i = 0; i < n_params; i++) {
+        float grad = loss_diff / (2.0f * noise_scale * delta[i]);
+        params_flat[i] -= learning_rate * grad;
+    }
+
+    // --- Apply updated params to main context ---
+    for (int il = 0; il < n_layer; il++) {
+        llama_set_kan_coefficients(ctx, il, &params_flat[il * KAN_N_KNOTS], KAN_N_KNOTS);
+    }
+
+    LLAMA_LOG_INFO("%s: L+=%.4f L-=%.4f diff=%.4f\n", __func__, loss_plus, loss_minus, loss_diff);
+
+    return -loss_diff; // positive when minus perturbation was better
 }
 
 //

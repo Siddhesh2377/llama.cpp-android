@@ -409,6 +409,182 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// Graph input for runtime head rescaling and per-head attention temperature.
+// Holds per-layer tensors that are filled with current scale/temperature data before each compute.
+class llm_graph_input_head_intervention : public llm_graph_input_i {
+public:
+    llm_graph_input_head_intervention(
+            const std::vector<std::vector<float>> * head_scales,
+            const std::vector<std::vector<float>> * attn_temperatures,
+            int32_t n_layer,
+            int32_t n_head)
+        : head_scales(head_scales), attn_temperatures(attn_temperatures),
+          n_layer(n_layer), n_head(n_head) {
+        scale_tensors.resize(n_layer, nullptr);
+        temp_tensors.resize(n_layer, nullptr);
+    }
+    virtual ~llm_graph_input_head_intervention() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // Per-layer tensors of shape [1, 1, n_head, 1] — created lazily during graph build
+    std::vector<ggml_tensor *> scale_tensors;  // head scale multipliers
+    std::vector<ggml_tensor *> temp_tensors;   // inverse temperature multipliers (1/T_h)
+
+    const std::vector<std::vector<float>> * head_scales;
+    const std::vector<std::vector<float>> * attn_temperatures;
+    int32_t n_layer;
+    int32_t n_head;
+};
+
+// Graph input for per-layer LayerNorm affine shift (Part G).
+// Adds a per-layer [n_embd] offset vector after normalization — cheapest personality modification.
+// Zero flash-attention penalty (operates on norm output, not attention scores).
+class llm_graph_input_norm_offsets : public llm_graph_input_i {
+public:
+    llm_graph_input_norm_offsets(
+            const std::vector<std::vector<float>> * norm_offsets,
+            int32_t n_layer, int32_t n_embd)
+        : norm_offsets(norm_offsets), n_layer(n_layer), n_embd(n_embd) {
+        offset_tensors.resize(n_layer, nullptr);
+    }
+    virtual ~llm_graph_input_norm_offsets() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    std::vector<ggml_tensor *> offset_tensors;  // [n_embd] per layer
+    const std::vector<std::vector<float>> * norm_offsets;
+    int32_t n_layer;
+    int32_t n_embd;
+};
+
+// Part P6: KAN-lite learnable activation overlay.
+// Per-layer spline data for the custom op callback.
+static constexpr int KAN_N_KNOTS = 8;
+static constexpr float KAN_GRID_MIN = -4.0f;
+static constexpr float KAN_GRID_SPACING = 1.0f; // 8 knots: -4, -3, -2, -1, 0, 1, 2, 3
+
+struct llm_kan_layer_data {
+    float coefficients[KAN_N_KNOTS]; // piecewise-linear spline knot values
+    float alpha;                      // strength multiplier (0 = disabled)
+};
+
+// Graph input for KAN-lite activation overlay (Part P6).
+// Each layer has a set of spline coefficients and a strength alpha.
+// Coefficients initialized to 0 = identity (no modification to base activation).
+class llm_graph_input_kan : public llm_graph_input_i {
+public:
+    llm_graph_input_kan(
+            const std::vector<std::vector<float>> * kan_coefficients,
+            float kan_alpha,
+            int32_t n_layer)
+        : kan_coefficients(kan_coefficients), kan_alpha(kan_alpha), n_layer(n_layer) {
+        layer_data.resize(n_layer);
+    }
+    virtual ~llm_graph_input_kan() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // Per-layer data passed as userdata to the custom op callback
+    std::vector<llm_kan_layer_data> layer_data;
+    const std::vector<std::vector<float>> * kan_coefficients;
+    float kan_alpha;
+    int32_t n_layer;
+};
+
+// Part P4: Hypernetwork — per-layer low-rank adaptation of FFN up-projection.
+// Stores rank-4 LoRA A [n_embd, rank] and B [rank, n_ff] matrices per target layer.
+// Applied as: tmp += strength * (B^T @ (A^T @ ffn_input)) after up-projection.
+// Target layers are the middle ~25% of the model (personality-relevant region).
+// Initialized to zero B (no effect); A can be random or direction-based.
+class llm_graph_input_hypernetwork : public llm_graph_input_i {
+public:
+    llm_graph_input_hypernetwork(
+            const std::vector<std::vector<float>> * lora_a,
+            const std::vector<std::vector<float>> * lora_b,
+            float strength,
+            int32_t rank,
+            int32_t layer_start,
+            int32_t layer_end,
+            int32_t n_embd,
+            int32_t n_ff)
+        : lora_a(lora_a), lora_b(lora_b), strength(strength),
+          rank(rank), layer_start(layer_start), layer_end(layer_end),
+          n_embd(n_embd), n_ff(n_ff) {
+        int n_target = layer_end - layer_start;
+        a_tensors.resize(n_target, nullptr);
+        b_tensors.resize(n_target, nullptr);
+    }
+    virtual ~llm_graph_input_hypernetwork() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // Per-target-layer LoRA tensors (created lazily in build_ffn)
+    std::vector<ggml_tensor *> a_tensors;  // [n_embd, rank] per target layer
+    std::vector<ggml_tensor *> b_tensors;  // [rank, n_ff] per target layer
+
+    const std::vector<std::vector<float>> * lora_a;  // [n_target][rank * n_embd]
+    const std::vector<std::vector<float>> * lora_b;  // [n_target][n_ff * rank]
+    float strength;
+    int32_t rank;
+    int32_t layer_start;
+    int32_t layer_end;
+    int32_t n_embd;
+    int32_t n_ff;
+};
+
+// Part P5: Dynamic sparse mask for FFN neurons.
+// Per-layer mask of shape [n_ff] applied via ggml_mul before down-projection.
+// Values in [0, 1]: 0 = neuron disabled, 1 = fully active.
+// Initialized to all 1.0 (identity). Updated periodically based on activation magnitudes.
+class llm_graph_input_sparse_mask : public llm_graph_input_i {
+public:
+    llm_graph_input_sparse_mask(
+            const std::vector<std::vector<float>> * sparse_masks,
+            int32_t n_layer)
+        : sparse_masks(sparse_masks), n_layer(n_layer) {
+        mask_tensors.resize(n_layer, nullptr);
+    }
+    virtual ~llm_graph_input_sparse_mask() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    std::vector<ggml_tensor *> mask_tensors;  // [n_ff] per layer (created lazily in build_ffn)
+    const std::vector<std::vector<float>> * sparse_masks;
+    int32_t n_layer;
+};
+
+// Attention score bias entry — boosts/suppresses attention to specific token positions.
+struct llm_attn_bias_entry {
+    int32_t start_pos;    // start of boosted span (inclusive)
+    int32_t end_pos;      // end of boosted span (exclusive)
+    float   bias;         // log-space bias (+2.0 ≈ 7.4× boost)
+    int32_t layer_start;  // apply to layers [start, end)
+    int32_t layer_end;    // -1 = all layers
+};
+
+// Graph input for attention score bias injection (Part C).
+// Adds per-position bias to kq scores before softmax, boosting attention to persona/system tokens.
+// Disables flash attention for affected layers.
+class llm_graph_input_attn_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_bias(
+            const std::vector<llm_attn_bias_entry> * attn_biases,
+            int32_t n_layer)
+        : attn_biases(attn_biases), n_layer(n_layer) {
+        bias_tensors.resize(n_layer, nullptr);
+        bias_n_kv.resize(n_layer, 0);
+    }
+    virtual ~llm_graph_input_attn_bias() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    std::vector<ggml_tensor *> bias_tensors;  // [n_kv] per layer (created lazily)
+    std::vector<int64_t> bias_n_kv;           // n_kv at creation time per layer
+    const std::vector<llm_attn_bias_entry> * attn_biases;
+    int32_t n_layer;
+};
+
 //
 // llm_graph_result
 //
@@ -441,6 +617,31 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // runtime behavior intervention (may point to empty vectors if not configured)
+    const std::vector<std::vector<float>> * head_scales;       // [n_layer][n_head] or empty
+    const std::vector<std::vector<float>> * attn_temperatures;  // [n_layer][n_head] or empty
+    const std::vector<std::vector<float>> * norm_offsets;       // [n_layer][n_embd] or empty
+    const std::vector<llm_attn_bias_entry> * attn_biases;      // attention score biases or empty
+    const std::vector<std::vector<float>> * kan_coefficients;  // [n_layer][KAN_N_KNOTS] or empty
+    float kan_alpha;                                            // KAN strength (0 = disabled)
+    const std::vector<std::vector<float>> * sparse_masks;      // [n_layer][n_ff] or empty
+
+    // Part P4: Hypernetwork FFN LoRA
+    const std::vector<std::vector<float>> * hyper_lora_a;      // [n_target][rank * n_embd] or empty
+    const std::vector<std::vector<float>> * hyper_lora_b;      // [n_target][n_ff * rank] or empty
+    float hyper_strength;                                       // global strength (0 = disabled)
+    int32_t hyper_rank;                                         // LoRA rank (typically 4)
+    int32_t hyper_layer_start;                                  // first target layer
+    int32_t hyper_layer_end;                                    // one past last target layer
+
+    // Gated Residual — per-layer scalar gate on attention and FFN outputs
+    // Empty = all 1.0 (no change). Values in [0, 2]: 0=skip, 1=default, 2=amplify.
+    const std::vector<float> * residual_attn_gates;  // [n_layer] or empty/nullptr
+    const std::vector<float> * residual_ffn_gates;   // [n_layer] or empty/nullptr
+
+    // Speculative decoding — early exit layer (-1 = disabled, >0 = exit after N layers)
+    int32_t early_exit_layer;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -527,7 +728,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            early_exit_layer == other.early_exit_layer;
     }
 };
 
@@ -612,7 +814,8 @@ struct llm_graph_context {
     const llama_ubatch  & ubatch;
 
     const int64_t n_embd;
-    const int64_t n_layer;
+    const int64_t n_layer;     // effective layers (may be < n_layer_all when early exit is active)
+    const int64_t n_layer_all; // total model layers (always hparams.n_layer)
     const int64_t n_rot;
     const int64_t n_ctx;       // user-specified context size (can be different from n_ctx_train)
     const int64_t n_head;
@@ -649,6 +852,30 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // runtime behavior intervention
+    const std::vector<std::vector<float>> * head_scales;
+    const std::vector<std::vector<float>> * attn_temperatures;
+    const std::vector<std::vector<float>> * norm_offsets;
+    const std::vector<llm_attn_bias_entry> * attn_biases;
+    const std::vector<std::vector<float>> * kan_coefficients;
+    float kan_alpha;
+    const std::vector<std::vector<float>> * sparse_masks;
+
+    // Part P4: Hypernetwork FFN LoRA
+    const std::vector<std::vector<float>> * hyper_lora_a;
+    const std::vector<std::vector<float>> * hyper_lora_b;
+    float hyper_strength;
+    int32_t hyper_rank;
+    int32_t hyper_layer_start;
+    int32_t hyper_layer_end;
+
+    // Gated Residual — per-layer scalar gate on attention and FFN outputs
+    const std::vector<float> * residual_attn_gates;
+    const std::vector<float> * residual_ffn_gates;
+
+    // Note: early_exit_layer is read from params during construction (sets n_layer).
+    // No need to store it as a member — n_layer already reflects the truncation.
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -662,6 +889,24 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    // Head intervention input (created lazily in constructor if head_scales/attn_temperatures are non-empty)
+    llm_graph_input_head_intervention * head_intervention = nullptr;
+
+    // Norm offset input (created lazily in constructor if norm_offsets are non-empty)
+    llm_graph_input_norm_offsets * norm_intervention = nullptr;
+
+    // Attention bias input (created lazily in constructor if attn_biases are non-empty)
+    llm_graph_input_attn_bias * attn_bias_input = nullptr;
+
+    // KAN-lite activation overlay input (created lazily in constructor if KAN is configured)
+    llm_graph_input_kan * kan_input = nullptr;
+
+    // Sparse mask input (created lazily in constructor if sparse masks are configured)
+    llm_graph_input_sparse_mask * sparse_mask_input = nullptr;
+
+    // Hypernetwork FFN LoRA input (created lazily in constructor if hypernetwork is configured)
+    llm_graph_input_hypernetwork * hypernetwork_input = nullptr;
 
     //
     // common
