@@ -1,13 +1,11 @@
-cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
+cmake_minimum_required(VERSION 3.14)
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
-#set(CMAKE_WARN_DEPRECATED YES)
 set(CMAKE_WARN_UNUSED_CLI YES)
-
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
@@ -22,67 +20,15 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(LLAMA_STANDALONE ON)
-
     include(git-vars)
-
-    # configure project version
-    # TODO
 else()
     set(LLAMA_STANDALONE OFF)
 endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 
-option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
-
-if (EMSCRIPTEN)
-    set(BUILD_SHARED_LIBS_DEFAULT OFF)
-
-    # Use 64-bit memory to support backend_get_memory queries
-    # TODO: analyze performance impact, see https://spidermonkey.dev/blog/2025/01/15/is-memory64-actually-worth-using
-    if (LLAMA_WASM_MEM64)
-      add_compile_options("-sMEMORY64=1")
-      add_link_options("-sMEMORY64=1")
-    endif()
-    add_link_options("-sALLOW_MEMORY_GROWTH=1")
-
-    option(LLAMA_WASM_SINGLE_FILE "llama: embed WASM inside the generated llama.js" OFF)
-    option(LLAMA_BUILD_HTML "llama: build HTML file" ON)
-    if (LLAMA_BUILD_HTML)
-        set(CMAKE_EXECUTABLE_SUFFIX ".html")
-    endif()
-else()
-    if (MINGW)
-        set(BUILD_SHARED_LIBS_DEFAULT OFF)
-    else()
-        set(BUILD_SHARED_LIBS_DEFAULT ON)
-    endif()
-endif()
-
+set(BUILD_SHARED_LIBS_DEFAULT ON)
 option(BUILD_SHARED_LIBS "build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
-
-if (WIN32)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-endif()
-
-if (MSVC)
-    add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
-    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
-    add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")
-    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/bigobj>")
-endif()
-
-if (LLAMA_STANDALONE)
-    # enable parallel builds for msbuild
-    list(APPEND CMAKE_VS_GLOBALS UseMultiToolTask=true)
-    list(APPEND CMAKE_VS_GLOBALS EnforceProcessCountAcrossBuilds=true)
-endif()
-
-if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    set(LLAMA_TOOLS_INSTALL_DEFAULT OFF)
-else()
-    set(LLAMA_TOOLS_INSTALL_DEFAULT ${LLAMA_STANDALONE})
-endif()
 
 #
 # option list
@@ -108,18 +54,12 @@ option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
-option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
+option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_STANDALONE})
 
 # 3rd party libs
 option(LLAMA_HTTPLIB    "llama: httplib for downloading functionality" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
-
-# deprecated
-option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
-if (LLAMA_CURL)
-    message(WARNING "LLAMA_CURL option is deprecated and will be ignored")
-endif()
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -154,37 +94,26 @@ function (llama_option_depr TYPE OLD NEW)
     endif()
 endfunction()
 
-llama_option_depr(FATAL_ERROR LLAMA_CUBLAS              GGML_CUDA)
 llama_option_depr(WARNING     LLAMA_CUDA                GGML_CUDA)
-llama_option_depr(WARNING     LLAMA_METAL               GGML_METAL)
-llama_option_depr(WARNING     LLAMA_METAL_EMBED_LIBRARY GGML_METAL_EMBED_LIBRARY)
 llama_option_depr(WARNING     LLAMA_NATIVE              GGML_NATIVE)
 llama_option_depr(WARNING     LLAMA_RPC                 GGML_RPC)
-llama_option_depr(WARNING     LLAMA_SYCL                GGML_SYCL)
-llama_option_depr(WARNING     LLAMA_SYCL_F16            GGML_SYCL_F16)
-llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
 
-if (NOT MSVC)
-    if (LLAMA_SANITIZE_THREAD)
-        message(STATUS "Using -fsanitize=thread")
+if (LLAMA_SANITIZE_THREAD)
+    message(STATUS "Using -fsanitize=thread")
+    add_compile_options(-fsanitize=thread)
+    link_libraries     (-fsanitize=thread)
+endif()
 
-        add_compile_options(-fsanitize=thread)
-        link_libraries     (-fsanitize=thread)
-    endif()
+if (LLAMA_SANITIZE_ADDRESS)
+    message(STATUS "Using -fsanitize=address")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    link_libraries     (-fsanitize=address)
+endif()
 
-    if (LLAMA_SANITIZE_ADDRESS)
-        message(STATUS "Using -fsanitize=address")
-
-        add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-        link_libraries     (-fsanitize=address)
-    endif()
-
-    if (LLAMA_SANITIZE_UNDEFINED)
-        message(STATUS "Using -fsanitize=undefined")
-
-        add_compile_options(-fsanitize=undefined)
-        link_libraries     (-fsanitize=undefined)
-    endif()
+if (LLAMA_SANITIZE_UNDEFINED)
+    message(STATUS "Using -fsanitize=undefined")
+    add_compile_options(-fsanitize=undefined)
+    link_libraries     (-fsanitize=undefined)
 endif()
 
 include("cmake/license.cmake")
@@ -204,7 +133,6 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
     add_subdirectory(ggml)
-    # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
 #
@@ -231,7 +159,6 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
-    add_subdirectory(pocs)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
@@ -288,18 +215,6 @@ write_basic_package_version_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
-
-install(
-    FILES convert_hf_to_gguf.py
-    PERMISSIONS
-        OWNER_READ
-        OWNER_WRITE
-        OWNER_EXECUTE
-        GROUP_READ
-        GROUP_EXECUTE
-        WORLD_READ
-        WORLD_EXECUTE
-    DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
