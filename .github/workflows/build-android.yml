@@ -1,0 +1,80 @@
+name: Build — Android (arm64-v8a)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: dynamic-backends
+            flags: >-
+              -DGGML_CPU_ALL_VARIANTS=ON
+              -DGGML_BACKEND_DL=ON
+              -DGGML_LLAMAFILE=OFF
+          - name: static
+            flags: >-
+              -DGGML_LLAMAFILE=OFF
+              -DBUILD_SHARED_LIBS=OFF
+
+    name: arm64-v8a (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.flags }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: List outputs
+        run: |
+          echo "=== Shared libraries ==="
+          find build/bin -name "*.so" -exec ls -lh {} \; 2>/dev/null || true
+          echo "=== Static libraries ==="
+          find build -name "*.a" -exec ls -lh {} \; 2>/dev/null || true
+          echo "=== Binaries ==="
+          find build/bin -executable -type f ! -name "*.so" -exec ls -lh {} \; 2>/dev/null || true
+
+      - name: Verify CPU backend variants
+        if: matrix.name == 'dynamic-backends'
+        run: |
+          echo "Checking for CPU backend .so variants..."
+          count=$(find build/bin -name "ggml-cpu-*.so" | wc -l)
+          echo "Found $count CPU backend variants"
+          find build/bin -name "ggml-cpu-*.so" -exec ls -lh {} \;
+          if [ "$count" -lt 2 ]; then
+            echo "::error::Expected multiple CPU backend variants, got $count"
+            exit 1
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-android-arm64-${{ matrix.name }}
+          path: |
+            build/bin/*.so
+            build/bin/ggml-cpu-*.so
+          retention-days: 7
