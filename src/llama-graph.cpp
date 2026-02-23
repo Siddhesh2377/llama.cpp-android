@@ -553,7 +553,7 @@ void llm_graph_input_head_intervention::set_input(const llama_ubatch * ubatch) {
     // fill head scale tensors
     if (head_scales && !head_scales->empty()) {
         for (int il = 0; il < n_layer; il++) {
-            if (scale_tensors[il] && il < (int)head_scales->size()) {
+            if (il < (int)head_scales->size() && scale_tensors[il]) {
                 ggml_backend_tensor_set(scale_tensors[il],
                     (*head_scales)[il].data(), 0,
                     n_head * sizeof(float));
@@ -565,7 +565,7 @@ void llm_graph_input_head_intervention::set_input(const llama_ubatch * ubatch) {
     if (attn_temperatures && !attn_temperatures->empty()) {
         std::vector<float> inv_temps(n_head);
         for (int il = 0; il < n_layer; il++) {
-            if (temp_tensors[il] && il < (int)attn_temperatures->size()) {
+            if (il < (int)attn_temperatures->size() && temp_tensors[il]) {
                 for (int h = 0; h < n_head; h++) {
                     float t = (*attn_temperatures)[il][h];
                     inv_temps[h] = (t > 0.0f) ? (1.0f / t) : 1.0f;
@@ -583,7 +583,7 @@ void llm_graph_input_norm_offsets::set_input(const llama_ubatch * ubatch) {
     if (!norm_offsets || norm_offsets->empty()) return;
 
     for (int il = 0; il < n_layer; il++) {
-        if (offset_tensors[il] && il < (int)norm_offsets->size() && !(*norm_offsets)[il].empty()) {
+        if (il < (int)norm_offsets->size() && offset_tensors[il] && !(*norm_offsets)[il].empty()) {
             ggml_backend_tensor_set(offset_tensors[il],
                 (*norm_offsets)[il].data(), 0,
                 n_embd * sizeof(float));
@@ -615,7 +615,7 @@ void llm_graph_input_sparse_mask::set_input(const llama_ubatch * ubatch) {
     if (!sparse_masks || sparse_masks->empty()) return;
 
     for (int il = 0; il < n_layer; il++) {
-        if (mask_tensors[il] && il < (int)sparse_masks->size() && !(*sparse_masks)[il].empty()) {
+        if (il < (int)sparse_masks->size() && mask_tensors[il] && !(*sparse_masks)[il].empty()) {
             ggml_backend_tensor_set(mask_tensors[il],
                 (*sparse_masks)[il].data(), 0,
                 (*sparse_masks)[il].size() * sizeof(float));
