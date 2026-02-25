@@ -12,18 +12,9 @@
 set(ENGINE_SOURCES
     src/model.cpp
     src/graph.cpp
-    src/interventions.cpp
     src/sampling.cpp
     src/tokenizer.cpp
-    src/personality.cpp
-    src/emotional.cpp
-    src/grammar.cpp
-    src/boundaries.cpp
-    src/rag.cpp
-    src/stall.cpp
     src/vision.cpp
-    src/tui.cpp
-    src/chat.cpp
 )
 
 add_library(gguf-engine STATIC ${ENGINE_SOURCES})
@@ -41,16 +32,13 @@ target_link_libraries(gguf-engine PUBLIC ggml ggml-base)
 target_compile_features(gguf-engine PUBLIC cxx_std_17)
 
 # ---------------------------------------------------------------------------
-# CLI executable (modular SDK)
+# VLM Pipeline Test CLI (standalone, for testing/optimization)
 # ---------------------------------------------------------------------------
-add_executable(gguf-engine-cli
-    main.cpp
-    tests/test_engine.cpp
-)
+add_executable(vlm-test vlm-test.cpp)
 
-target_link_libraries(gguf-engine-cli PRIVATE gguf-engine)
+target_link_libraries(vlm-test PRIVATE gguf-engine)
 
-target_include_directories(gguf-engine-cli PRIVATE
+target_include_directories(vlm-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/ggml/include
 )

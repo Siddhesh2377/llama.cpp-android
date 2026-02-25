@@ -8,10 +8,9 @@
 bool load_vision_model(VisionModelState & vstate, const char * path,
                        ggml_backend_t backend);
 
-// Build vision transformer graph
+// Build vision transformer graph (uses internal state populated by load_vision_model)
 struct ggml_cgraph * build_vision_graph(
-    struct ggml_context * ctx, VisionModelState & vstate,
-    int n_patches, int seq_len);
+    struct ggml_context * ctx, VisionModelState & vstate);
 
 // Free vision model resources
 void free_vision_model(VisionModelState & vstate);
