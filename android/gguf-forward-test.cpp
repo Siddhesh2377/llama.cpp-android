@@ -9619,7 +9619,19 @@ int main(int argc, char ** argv) {
         printf("FAIL: no CPU backend\n");
         return 1;
     }
-    ggml_backend_cpu_set_n_threads(cpu_backend, n_threads);
+    // Set thread count via backend registry (dynamic backend compatible)
+    {
+        auto * dev = ggml_backend_get_device(cpu_backend);
+        if (dev) {
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            if (reg) {
+                typedef void (*set_n_threads_fn_t)(ggml_backend_t, int);
+                auto fn = (set_n_threads_fn_t)ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cpu_set_n_threads");
+                if (fn) fn(cpu_backend, n_threads);
+            }
+        }
+    }
     printf("CPU backend: %s (%d threads)\n", ggml_backend_name(cpu_backend), n_threads);
 
     ggml_backend_t gpu_backend = nullptr;
