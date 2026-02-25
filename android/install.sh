@@ -7,12 +7,12 @@
 #
 # Requirements: curl, adb (for device push), or run directly on Android via Termux
 #
-# Layout (everything in current directory):
-#   ./gguf-engine-cli              binary
-#   ./lib*.so                      shared libraries
-#   ./.config/config.json          runtime config
-#   ./.config/aria.json            character personality
-#   ./.config/models/              model directory (CLI downloads models here)
+# Layout (everything in ./gguf-engine/ relative to pwd):
+#   ./gguf-engine/gguf-engine-cli          binary
+#   ./gguf-engine/lib*.so                  shared libraries
+#   ./gguf-engine/.config/config.json      runtime config
+#   ./gguf-engine/.config/aria.json        character personality
+#   ./gguf-engine/.config/models/          model directory (CLI downloads models here)
 
 set -e
 
@@ -46,29 +46,25 @@ echo -e "  ${BOLD}${CYAN}│     Character Intelligence Engine    │${NC}"
 echo -e "  ${BOLD}${CYAN}└──────────────────────────────────────┘${NC}"
 echo ""
 
-# ── Detect environment ──────────────────────────────────────────────────────
-# Everything installs to ./gguf-engine in the current directory. Always.
+# ── Setup ───────────────────────────────────────────────────────────────────
+# Everything goes into ./gguf-engine/ in the current working directory.
 INSTALL_DIR="./gguf-engine"
-
-if [ -d "/data/local/tmp" ] && [ "$(uname -m)" = "aarch64" ]; then
-    MODE="direct"
-    TOTAL_STEPS=4
-    info "Environment : Android (aarch64)"
-elif command -v adb &>/dev/null; then
-    MODE="adb"
-    TOTAL_STEPS=5
-    info "Environment : Desktop + ADB"
-else
-    MODE="download"
-    TOTAL_STEPS=4
-    info "Environment : Desktop"
-fi
-
-info "Install dir : ${CYAN}${INSTALL_DIR}${NC}"
-
 CONFIG_DIR="${INSTALL_DIR}/.config"
 
-# Create local directories (even in ADB mode — download locally first)
+# Detect if ADB is available for optional device push
+if command -v adb &>/dev/null && adb devices 2>/dev/null | grep -q "device$"; then
+    HAS_ADB=true
+    TOTAL_STEPS=5
+    info "Environment : $(uname -s) (ADB connected)"
+else
+    HAS_ADB=false
+    TOTAL_STEPS=4
+    info "Environment : $(uname -s)"
+fi
+
+info "Install dir : ${CYAN}$(pwd)/gguf-engine/${NC}"
+
+# Create directories
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$CONFIG_DIR/models"
 
@@ -177,31 +173,16 @@ CONFEOF
 
 success "Config created → .config/config.json"
 
-# ── Step 5: ADB push (only in ADB mode) ────────────────────────────────────
-if [ "$MODE" = "adb" ]; then
+# ── Step 5: ADB push (only if ADB connected) ───────────────────────────────
+if [ "$HAS_ADB" = true ]; then
     step 5 "Push to device via ADB"
 
-    echo ""
-    echo -e "  ${DIM}Where on device? (default: /data/local/tmp/gguf-engine)${NC}"
-    read -p "  Device path: " device_path
-    DEVICE_DIR="${device_path:-/data/local/tmp/gguf-engine}"
+    # Push entire gguf-engine/ directory to device
+    info "Pushing to device..."
+    adb push "${INSTALL_DIR}" /sdcard/gguf-engine/ 2>&1 | tail -1
+    adb shell "chmod +x /sdcard/gguf-engine/gguf-engine-cli" 2>/dev/null
 
-    adb shell "mkdir -p ${DEVICE_DIR}/.config/models" 2>/dev/null
-
-    info "Pushing binary..."
-    adb push "${INSTALL_DIR}/gguf-engine-cli" "${DEVICE_DIR}/" 2>&1 | tail -1
-    adb shell "chmod +x ${DEVICE_DIR}/gguf-engine-cli"
-
-    info "Pushing libraries..."
-    for lib in "$INSTALL_DIR"/libggml*.so "$INSTALL_DIR"/libllama*.so; do
-        [ -f "$lib" ] && adb push "$lib" "${DEVICE_DIR}/" 2>&1 | tail -1
-    done
-
-    info "Pushing .config/..."
-    adb push "${CONFIG_DIR}/config.json" "${DEVICE_DIR}/.config/" 2>&1 | tail -1
-    adb push "${CONFIG_DIR}/aria.json" "${DEVICE_DIR}/.config/" 2>&1 | tail -1
-
-    success "All files pushed → ${DEVICE_DIR}"
+    success "Pushed to /sdcard/gguf-engine/"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -211,7 +192,7 @@ echo ""
 echo -e "  ${BOLD}${GREEN}Installation complete!${NC}"
 echo ""
 echo -e "  ${DIM}Files:${NC}"
-echo -e "    ${INSTALL_DIR}/"
+echo -e "    $(pwd)/gguf-engine/"
 echo -e "    ├── gguf-engine-cli"
 echo -e "    ├── lib*.so"
 echo -e "    └── .config/"
@@ -223,17 +204,20 @@ line
 echo ""
 echo -e "  ${BOLD}Quick start:${NC}"
 echo ""
+echo -e "    ${CYAN}cd $(pwd)/gguf-engine${NC}"
+echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
 
-if [ "$MODE" = "adb" ]; then
+if [ "$HAS_ADB" = true ]; then
+    echo ""
+    echo -e "  ${BOLD}On device:${NC}"
+    echo ""
     echo -e "    ${CYAN}adb shell${NC}"
-    echo -e "    ${CYAN}cd ${DEVICE_DIR}${NC}"
-    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
-else
-    echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
+    echo -e "    ${CYAN}cd /sdcard/gguf-engine${NC}"
     echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
 fi
 
 echo ""
 echo -e "  ${DIM}Config auto-loaded from .config/config.json${NC}"
 echo -e "  ${DIM}Type /help in chat for commands${NC}"
+echo -e "  ${DIM}Use /download-model to download a model${NC}"
 echo ""
