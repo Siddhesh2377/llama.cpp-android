@@ -25,8 +25,8 @@ NC='\033[0m'
 
 header() {
     echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║     gguf-engine v${VERSION} installer     ║${NC}"
-    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════╝${NC}\n"
+    echo -e "${BOLD}${CYAN}  ║   gguf-engine v${VERSION} installer  ║${NC}"
+    echo -e "${BOLD}${CYAN}  ╚══════════════════════════════════════╝${NC}\n"
 }
 
 info() { echo -e "${DIM}  $1${NC}"; }
@@ -99,7 +99,30 @@ else
         fi
     }
 fi
+chmod +x "$BINARY_PATH"
 success "Binary ready"
+
+# Download shared libraries
+echo -e "\n  ${BOLD}Step 1b: Download shared libraries${NC}"
+LIBS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/gguf-engine-libs-arm64.tar.gz"
+LIBS_DIR="$INSTALL_DIR"
+if [ "$MODE" = "adb" ]; then
+    LIBS_DIR="/tmp"
+fi
+
+if ls "$LIBS_DIR"/libggml*.so 1>/dev/null 2>&1; then
+    warn "Shared libraries already exist, skipping"
+else
+    info "Downloading shared libraries (~9.4 MB)..."
+    curl -L --progress-bar -o "$LIBS_DIR/gguf-engine-libs-arm64.tar.gz" "$LIBS_URL" 2>&1 || {
+        warn "Library download failed. You may need to build from source."
+    }
+    if [ -f "$LIBS_DIR/gguf-engine-libs-arm64.tar.gz" ]; then
+        tar xzf "$LIBS_DIR/gguf-engine-libs-arm64.tar.gz" -C "$LIBS_DIR"
+        rm -f "$LIBS_DIR/gguf-engine-libs-arm64.tar.gz"
+        success "Shared libraries extracted"
+    fi
+fi
 
 # Download character JSON
 echo -e "\n  ${BOLD}Step 2: Download character config${NC}"
@@ -185,6 +208,9 @@ esac
 if [ "$MODE" = "adb" ]; then
     echo -e "\n  ${BOLD}Step 4: Push to device${NC}"
     adb push /tmp/gguf-engine-cli /data/local/tmp/ 2>&1 | tail -1
+    for lib in /tmp/libggml*.so; do
+        [ -f "$lib" ] && adb push "$lib" /data/local/tmp/ 2>&1 | tail -1
+    done
     adb push /tmp/aria.json /data/local/tmp/ 2>&1 | tail -1
     adb shell "chmod +x /data/local/tmp/gguf-engine-cli"
     if [ -n "$MODEL_PATH" ] && [ -f "$MODEL_PATH" ]; then
