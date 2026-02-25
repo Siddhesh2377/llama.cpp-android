@@ -2910,19 +2910,17 @@ static void ggml_backend_opencl_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_opencl_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // Delegate to buffer's set_tensor (writes are blocking, but clWaitForEvents removed)
+    ggml_backend_buffer_t buf = tensor->buffer;
+    buf->iface.set_tensor(buf, tensor, data, offset, size);
     GGML_UNUSED(backend);
-    GGML_UNUSED(tensor);
-    GGML_UNUSED(data);
-    GGML_UNUSED(offset);
-    GGML_UNUSED(size);
 }
 
 static void ggml_backend_opencl_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    // get_tensor must remain blocking — caller needs the data immediately
+    ggml_backend_buffer_t buf = tensor->buffer;
+    buf->iface.get_tensor(buf, tensor, data, offset, size);
     GGML_UNUSED(backend);
-    GGML_UNUSED(tensor);
-    GGML_UNUSED(data);
-    GGML_UNUSED(offset);
-    GGML_UNUSED(size);
 }
 
 static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
@@ -3353,8 +3351,8 @@ static ggml_guid_t ggml_backend_opencl_guid() {
 static ggml_backend_i ggml_backend_opencl_i = {
     /* .get_name                = */ ggml_backend_opencl_name,
     /* .free                    = */ ggml_backend_opencl_free,
-    /* .set_tensor_async        = */ NULL,  /* ggml_backend_opencl_set_tensor_async */
-    /* .get_tensor_async        = */ NULL,  /* ggml_backend_opencl_get_tensor_async */
+    /* .set_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ NULL,
     /* .cpy_tensor_async        = */ NULL,  /* ggml_backend_opencl_cpy_tensor_async */
     /* .synchronize             = */ ggml_backend_opencl_synchronize,
     /* .graph_plan_create       = */ NULL,
@@ -3707,9 +3705,8 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
 
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        // In-order queue: kernel waits for write, release deferred until kernel completes
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
@@ -3830,8 +3827,8 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t local_size_q[3] = {4, 16, 1};
         size_t global_size_q[3] = {static_cast<size_t>(width_q), static_cast<size_t>(height_q), 1};
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        // In-order queue: no wait needed between sequential kernels
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_q, local_size_q, 0, NULL, NULL));
 
         // scales
         int height_s = M / 4;
@@ -3849,19 +3846,18 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
         size_t local_size_s[3] = {4, 16, 1};
         size_t global_size_s[3] = {static_cast<size_t>(width_s), static_cast<size_t>(height_s), 1};
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_size_s, local_size_s, 0, NULL, NULL));
         // <----------------------------------------------------------------------------------> //
 
         // copy transposed buffer contents to original buffers
         // <----------------------------------------------------------------------------------> //
-        // weights
-        CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        // weights — in-order queue serializes: transpose finishes before copy starts
+        CL_CHECK(clEnqueueCopyBuffer(queue, qT_d, extra->q, 0, 0, q_size_bytes, 0, NULL, NULL));
 
         // scales
-        CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clEnqueueCopyBuffer(queue, dT_d, extra->d, 0, 0, d_size_bytes, 0, NULL, NULL));
+        // Flush to ensure all commands are submitted; deferred free keeps buffers alive
+        CL_CHECK(clFlush(queue));
         // <----------------------------------------------------------------------------------> //
 
         // deallocate transpose buffers
@@ -3940,9 +3936,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             size_t global_work_size[3] = {static_cast<size_t>(((ne01 + 63) / 64) * 64), static_cast<size_t>(ne00 / 32), static_cast<size_t>(ne02)};
             size_t local_work_size[3] = {64, 2, 1};
 
-            cl_event evt;
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-            CL_CHECK(clWaitForEvents(1, &evt));
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
             tensor->extra = extra;
 
@@ -3958,9 +3952,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t global_work_size[3] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[3] = {64, 1, 1};
 
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
 
         // Create image for Q
@@ -4026,9 +4018,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {64, 1, 1};
 
-        cl_event evt;
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
@@ -4166,10 +4156,9 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {1, 1, 1};
 
-        cl_event evt;
+        // In-order queue: blocking read implicitly waits for kernel completion
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
-            global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+            global_work_size, local_work_size, 0, NULL, NULL));
         CL_CHECK(clEnqueueReadBuffer(
             queue, data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
@@ -4199,10 +4188,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             size_t global_work_size[3] = {static_cast<size_t>(((ne01 + 63) / 64) * 64), static_cast<size_t>(ne00 / 32), static_cast<size_t>(ne02)};
             size_t local_work_size[3] = {64, 2, 1};
 
-            cl_event evt;
             CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
-                global_work_size, local_work_size, 0, NULL, &evt));
-            CL_CHECK(clWaitForEvents(1, &evt));
+                global_work_size, local_work_size, 0, NULL, NULL));
             CL_CHECK(clEnqueueReadBuffer(
                 queue, data_device, CL_TRUE, offset,
                 size, data, 0, NULL, NULL));
@@ -4218,10 +4205,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {1, 1, 1};
 
-        cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
-            global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+            global_work_size, local_work_size, 0, NULL, NULL));
         CL_CHECK(clEnqueueReadBuffer(
             queue, data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
@@ -4244,10 +4229,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {1, 1, 1};
 
-        cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL,
-            global_work_size, local_work_size, 0, NULL, &evt));
-        CL_CHECK(clWaitForEvents(1, &evt));
+            global_work_size, local_work_size, 0, NULL, NULL));
         CL_CHECK(clEnqueueReadBuffer(
             queue, data_device, CL_TRUE, offset,
             size, data, 0, NULL, NULL));
@@ -4447,6 +4430,43 @@ static bool ggml_backend_opencl_device_supports_buft(ggml_backend_dev_t dev, ggm
     return backend_ctx0->context == backend_ctx1->context;
 }
 
+// Hybrid CPU/GPU dispatch: decide which ops benefit from GPU execution.
+// GPU wins on compute-bound ops (large matmuls, flash attention).
+// CPU wins on memory-bound ops (GEMV, small element-wise).
+static bool ggml_backend_opencl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_MUL_MAT: {
+            // ne[1] of the result = number of rows = batch/token count
+            // GEMV (M=1): CPU NEON is 10x faster due to zero dispatch overhead
+            // GEMM (M>1): GPU wins ~2x on large matmuls (prefill)
+            const int64_t M = op->ne[1];  // rows in output = tokens
+            const int64_t K = op->src[0]->ne[0];  // inner dimension
+            const int64_t N = op->src[0]->ne[1];  // cols in weight
+
+            // Only offload batch matmuls where GPU compute advantage > dispatch cost
+            // Threshold: M >= 4 AND at least 512 dimensions
+            if (M >= 4 && K >= 512 && N >= 512) {
+                return true;
+            }
+            return false;
+        }
+        case GGML_OP_MUL_MAT_ID: {
+            const int64_t M = op->ne[1];
+            if (M >= 4) {
+                return true;
+            }
+            return false;
+        }
+        case GGML_OP_FLASH_ATTN_EXT:
+            // Flash attention is always compute-bound — offload to GPU
+            return true;
+        default:
+            return false;
+    }
+
+    GGML_UNUSED(dev);
+}
+
 namespace /* anonymous */ {
 struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .get_name             = */ ggml_backend_opencl_device_get_name,
@@ -4460,7 +4480,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .buffer_from_host_ptr = */ ggml_backend_opencl_device_buffer_from_ptr,
     /* .supports_op          = */ ggml_backend_opencl_device_supports_op,
     /* .supports_buft        = */ ggml_backend_opencl_device_supports_buft,
-    /* .offload_op           = */ NULL,
+    /* .offload_op           = */ ggml_backend_opencl_device_offload_op,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,

@@ -11,6 +11,10 @@
 #include <cfloat>
 #include <cmath>
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -3662,32 +3666,66 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+                // NEON: 4-accumulator sum-of-squares for maximum ILP
+                float32x4_t vsum0 = vdupq_n_f32(0.0f);
+                float32x4_t vsum1 = vdupq_n_f32(0.0f);
+                float32x4_t vsum2 = vdupq_n_f32(0.0f);
+                float32x4_t vsum3 = vdupq_n_f32(0.0f);
+                int64_t i00 = 0;
+                for (; i00 + 15 < ne00; i00 += 16) {
+                    float32x4_t v0 = vld1q_f32(x + i00);
+                    float32x4_t v1 = vld1q_f32(x + i00 + 4);
+                    float32x4_t v2 = vld1q_f32(x + i00 + 8);
+                    float32x4_t v3 = vld1q_f32(x + i00 + 12);
+                    vsum0 = vfmaq_f32(vsum0, v0, v0);
+                    vsum1 = vfmaq_f32(vsum1, v1, v1);
+                    vsum2 = vfmaq_f32(vsum2, v2, v2);
+                    vsum3 = vfmaq_f32(vsum3, v3, v3);
+                }
+                vsum0 = vaddq_f32(vaddq_f32(vsum0, vsum1), vaddq_f32(vsum2, vsum3));
+                ggml_float sum = (ggml_float)vaddvq_f32(vsum0);
+                for (; i00 < ne00; i00++) {
+                    sum += (ggml_float)(x[i00] * x[i00]);
+                }
+#else
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
                 }
+#endif
 
                 const float mean = sum/ne00;
-
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                memcpy(y, x, ne00 * sizeof(float));
-                // for (int i00 = 0; i00 < ne00; i00++) {
-                //     y[i00] = x[i00];
-                // }
-
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+                // NEON: fused copy + scale in a single pass (halves memory traffic)
+                {
+                    float32x4_t vscale = vdupq_n_f32(scale);
+                    int64_t j = 0;
+                    for (; j + 15 < ne00; j += 16) {
+                        vst1q_f32(y + j,      vmulq_f32(vld1q_f32(x + j),      vscale));
+                        vst1q_f32(y + j + 4,  vmulq_f32(vld1q_f32(x + j + 4),  vscale));
+                        vst1q_f32(y + j + 8,  vmulq_f32(vld1q_f32(x + j + 8),  vscale));
+                        vst1q_f32(y + j + 12, vmulq_f32(vld1q_f32(x + j + 12), vscale));
+                    }
+                    for (; j < ne00; j++) {
+                        y[j] = x[j] * scale;
+                    }
+                }
+#else
+                memcpy(y, x, ne00 * sizeof(float));
                 ggml_vec_scale_f32(ne00, y, scale);
+#endif
             }
         }
     }
@@ -5222,6 +5260,38 @@ static void ggml_compute_forward_soft_max_f32(
                 ggml_vec_cpy_f32  (ne00, wp, sp);
                 ggml_vec_scale_f32(ne00, wp, scale);
                 if (mp_f32) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+                    if (use_f16) {
+                        float32x4_t vslope = vdupq_n_f32(slope);
+                        int i = 0;
+                        for (; i + 7 < ne00; i += 8) {
+                            float16x8_t vh = vld1q_f16((const __fp16 *)(mp_f16 + i));
+                            float32x4_t vm_lo = vcvt_f32_f16(vget_low_f16(vh));
+                            float32x4_t vm_hi = vcvt_f32_f16(vget_high_f16(vh));
+                            float32x4_t vwp0 = vld1q_f32(wp + i);
+                            float32x4_t vwp1 = vld1q_f32(wp + i + 4);
+                            vst1q_f32(wp + i,     vfmaq_f32(vwp0, vslope, vm_lo));
+                            vst1q_f32(wp + i + 4, vfmaq_f32(vwp1, vslope, vm_hi));
+                        }
+                        for (; i < ne00; ++i) {
+                            wp[i] += slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
+                        }
+                    } else {
+                        float32x4_t vslope = vdupq_n_f32(slope);
+                        int i = 0;
+                        for (; i + 7 < ne00; i += 8) {
+                            float32x4_t vwp0 = vld1q_f32(wp + i);
+                            float32x4_t vwp1 = vld1q_f32(wp + i + 4);
+                            float32x4_t vm0 = vld1q_f32(mp_f32 + i);
+                            float32x4_t vm1 = vld1q_f32(mp_f32 + i + 4);
+                            vst1q_f32(wp + i,     vfmaq_f32(vwp0, vslope, vm0));
+                            vst1q_f32(wp + i + 4, vfmaq_f32(vwp1, vslope, vm1));
+                        }
+                        for (; i < ne00; ++i) {
+                            wp[i] += slope*mp_f32[i];
+                        }
+                    }
+#else
                     if (use_f16) {
                         for (int i = 0; i < ne00; ++i) {
                             wp[i] += slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
@@ -5231,6 +5301,7 @@ static void ggml_compute_forward_soft_max_f32(
                             wp[i] += slope*mp_f32[i];
                         }
                     }
+#endif
                 }
 
 #ifndef NDEBUG
@@ -5632,8 +5703,71 @@ static void ggml_mrope_cache_init(
 }
 
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+// NEON-optimized ROPE rotation for F32 — processes 4 pairs per iteration
+static void rotate_pairs_f32_neon(const int64_t n, const int64_t n_offset,
+                                   const float * cache, const float * src_data,
+                                   float * dst_data, const int scale) {
+    int64_t i0 = 0;
+
+    if (scale == 2) {
+        // NEOX/MROPE/VISION: x0 and x1 are n_offset apart, contiguous within each half
+        for (; i0 + 7 < n; i0 += 8) {
+            const int64_t ic = i0 / 2;
+            float32x4x2_t cs = vld2q_f32(cache + i0); // cs.val[0]=cos, cs.val[1]=sin
+            float32x4_t x0 = vld1q_f32(src_data + ic);
+            float32x4_t x1 = vld1q_f32(src_data + ic + n_offset);
+
+            float32x4_t r0 = vmulq_f32(x0, cs.val[0]);
+            r0 = vfmsq_f32(r0, x1, cs.val[1]); // x0*cos - x1*sin
+
+            float32x4_t r1 = vmulq_f32(x1, cs.val[0]);
+            r1 = vfmaq_f32(r1, x0, cs.val[1]); // x1*cos + x0*sin
+
+            vst1q_f32(dst_data + ic, r0);
+            vst1q_f32(dst_data + ic + n_offset, r1);
+        }
+    } else {
+        // NORMAL: pairs are consecutive (x0,x1) at stride 1
+        for (; i0 + 7 < n; i0 += 8) {
+            float32x4x2_t cs = vld2q_f32(cache + i0);   // deinterleave cos/sin
+            float32x4x2_t xy = vld2q_f32(src_data + i0); // deinterleave x0/x1
+
+            float32x4_t r0 = vmulq_f32(xy.val[0], cs.val[0]);
+            r0 = vfmsq_f32(r0, xy.val[1], cs.val[1]); // x0*cos - x1*sin
+
+            float32x4_t r1 = vmulq_f32(xy.val[1], cs.val[0]);
+            r1 = vfmaq_f32(r1, xy.val[0], cs.val[1]); // x1*cos + x0*sin
+
+            float32x4x2_t result = {{ r0, r1 }};
+            vst2q_f32(dst_data + i0, result); // re-interleave
+        }
+    }
+
+    // Scalar tail
+    for (; i0 < n; i0 += 2) {
+        const int64_t ic = i0 / scale;
+        const float cos_theta = cache[i0 + 0];
+        const float sin_theta = cache[i0 + 1];
+        const float x0 = src_data[ic];
+        const float x1 = src_data[ic + n_offset];
+        dst_data[ic]            = x0*cos_theta - x1*sin_theta;
+        dst_data[ic + n_offset] = x0*sin_theta + x1*cos_theta;
+    }
+}
+#endif
+
 template<typename T>
 static void rotate_pairs(const int64_t n, const int64_t n_offset, const float * cache, const T * src_data, T * dst_data, const int scale = 2) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+  // Use NEON fast path for F32
+  if (sizeof(T) == sizeof(float)) {
+      rotate_pairs_f32_neon(n, n_offset, cache,
+                            reinterpret_cast<const float*>(src_data),
+                            reinterpret_cast<float*>(dst_data), scale);
+      return;
+  }
+#endif
   for (int64_t i0 = 0; i0 < n; i0 += 2) {
     const int64_t ic = i0/scale; // hack for GGML_ROPE_TYPE_NORMAL, where we need ic = i0; for all other cases, ic = i0/2
 

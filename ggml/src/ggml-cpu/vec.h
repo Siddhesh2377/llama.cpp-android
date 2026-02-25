@@ -1554,14 +1554,31 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 }
 
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
+#if defined(GGML_USE_ACCELERATE)
+    vDSP_maxv(x, 1, s, n);
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    float32x4_t vmax = vdupq_n_f32(-INFINITY);
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i));
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i + 4));
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i + 8));
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i + 12));
+    }
+    for (; i + 3 < n; i += 4) {
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i));
+    }
+    float max = vmaxvq_f32(vmax);
+    for (; i < n; ++i) {
+        if (x[i] > max) max = x[i];
+    }
+    *s = max;
+#else
     float max = -INFINITY;
     for (int i = 0; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;
-#else
-    vDSP_maxv(x, 1, s, n);
 #endif
 }
 
