@@ -12,7 +12,7 @@
 #   ./lib*.so                      shared libraries
 #   ./.config/config.json          runtime config
 #   ./.config/aria.json            character personality
-#   ./.config/models/model.gguf    downloaded model
+#   ./.config/models/              model directory (CLI downloads models here)
 
 set -e
 
@@ -50,21 +50,21 @@ echo ""
 if [ -d "/data/local/tmp" ] && [ "$(uname -m)" = "aarch64" ]; then
     MODE="direct"
     INSTALL_DIR="/data/local/tmp/gguf-engine"
-    TOTAL_STEPS=5
+    TOTAL_STEPS=4
     info "Environment : Android (aarch64)"
     info "Install dir : ${CYAN}${INSTALL_DIR}${NC}"
 elif command -v adb &>/dev/null; then
     MODE="adb"
     INSTALL_DIR="./gguf-engine"
     DEVICE_DIR="/data/local/tmp/gguf-engine"
-    TOTAL_STEPS=6
+    TOTAL_STEPS=5
     info "Environment : Desktop + ADB"
     info "Download to : ${CYAN}${INSTALL_DIR}${NC}"
     info "Push to     : ${CYAN}${DEVICE_DIR}${NC}"
 else
     MODE="download"
     INSTALL_DIR="./gguf-engine"
-    TOTAL_STEPS=5
+    TOTAL_STEPS=4
     info "Environment : Desktop (no ADB)"
     info "Install dir : ${CYAN}${INSTALL_DIR}${NC}"
 fi
@@ -158,46 +158,12 @@ ARIAEOF
 fi
 success "Character config → .config/aria.json"
 
-# ── Step 4: Model download ─────────────────────────────────────────────────
-step 4 "Download model (optional)"
+# ── Step 4: Config ──────────────────────────────────────────────────────────
+step 4 "Create runtime config"
 
-echo ""
-echo -e "  ${CYAN}Available models:${NC}"
-echo ""
-echo -e "    ${BOLD}1)${NC} Qwen3-0.6B-Q8_0    ${DIM}660 MB  —  Best quality${NC}"
-echo -e "    ${BOLD}2)${NC} Qwen3-0.6B-Q4_K_M  ${DIM}430 MB  —  Good balance${NC}"
-echo -e "    ${BOLD}3)${NC} Skip"
-echo ""
-
-read -p "  Select [1/2/3]: " model_choice
-
-MODEL_PATH="${CONFIG_DIR}/models/model.gguf"
-
-case "$model_choice" in
-    1)
-        MODEL_URL="https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q8_0.gguf"
-        info "Downloading Qwen3-0.6B-Q8_0 (660 MB)..."
-        curl -L --progress-bar -o "$MODEL_PATH" "$MODEL_URL"
-        success "Model downloaded → .config/models/model.gguf"
-        ;;
-    2)
-        MODEL_URL="https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q4_k_m.gguf"
-        info "Downloading Qwen3-0.6B-Q4_K_M (430 MB)..."
-        curl -L --progress-bar -o "$MODEL_PATH" "$MODEL_URL"
-        success "Model downloaded → .config/models/model.gguf"
-        ;;
-    *)
-        warn "Skipping model download"
-        MODEL_PATH=""
-        ;;
-esac
-
-# ── Step 5: Config ──────────────────────────────────────────────────────────
-step 5 "Create runtime config"
-
-cat > "${CONFIG_DIR}/config.json" << CONFEOF
+cat > "${CONFIG_DIR}/config.json" << 'CONFEOF'
 {
-    "model_path": "${MODEL_PATH:-.config/models/model.gguf}",
+    "model_path": ".config/models/model.gguf",
     "character_json": ".config/aria.json",
     "threads": 4,
     "gpu": 0,
@@ -214,9 +180,9 @@ CONFEOF
 
 success "Config created → .config/config.json"
 
-# ── Step 6: ADB push (only in ADB mode) ────────────────────────────────────
+# ── Step 5: ADB push (only in ADB mode) ────────────────────────────────────
 if [ "$MODE" = "adb" ]; then
-    step 6 "Push to device via ADB"
+    step 5 "Push to device via ADB"
 
     adb shell "mkdir -p ${DEVICE_DIR}/.config/models" 2>/dev/null
 
@@ -232,11 +198,6 @@ if [ "$MODE" = "adb" ]; then
     info "Pushing .config/..."
     adb push "${CONFIG_DIR}/config.json" "${DEVICE_DIR}/.config/" 2>&1 | tail -1
     adb push "${CONFIG_DIR}/aria.json" "${DEVICE_DIR}/.config/" 2>&1 | tail -1
-
-    if [ -n "$MODEL_PATH" ] && [ -f "$MODEL_PATH" ]; then
-        info "Pushing model (this may take a while)..."
-        adb push "$MODEL_PATH" "${DEVICE_DIR}/.config/models/model.gguf" 2>&1 | tail -1
-    fi
 
     success "All files pushed → ${DEVICE_DIR}"
     INSTALL_DIR="$DEVICE_DIR"
@@ -255,8 +216,7 @@ echo -e "    ├── lib*.so"
 echo -e "    └── .config/"
 echo -e "        ├── config.json"
 echo -e "        ├── aria.json"
-echo -e "        └── models/"
-echo -e "            └── model.gguf"
+echo -e "        └── models/          ${DIM}(CLI downloads models here)${NC}"
 echo ""
 line
 echo ""
