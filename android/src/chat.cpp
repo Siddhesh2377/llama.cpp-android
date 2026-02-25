@@ -540,14 +540,62 @@ bool handle_chat_command(
         tui::success("Conversation reset (KV cache cleared, mood reset)");
     }
     else if (cmd == "download-model") {
-        tui::banner("Available Models");
-        printf("  1. Qwen3-0.6B-Q8_0     (660 MB)  Best quality, slower\n");
-        printf("  2. Qwen3-0.6B-Q4_K_M   (430 MB)  Good balance\n");
-        printf("  3. SmolLM3-3B-Q4_K_M   (1.9 GB)  Best quality, needs more RAM\n\n");
-        printf("  Download with curl:\n");
-        printf("  \033[36m");
-        printf("  curl -L -o model.gguf https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q8_0.gguf\n");
-        printf("\033[0m\n");
+        tui::banner("Download Model");
+        printf("  %-4s %-34s %s\n", "", "Model", "Size");
+        printf("  %-4s %-34s %s\n", "1.", "Qwen3-0.6B-Q8_0", "639 MB");
+        printf("  %-4s %-34s %s\n", "2.", "SmolLM3-3B-Q4_K_M", "1.9 GB");
+        printf("  %-4s %-34s %s\n", "3.", "SmolLM3-3B-Q8_0", "3.3 GB");
+        printf("  %-4s %-34s %s\n", "4.", "SmolVLM-500M-Q8_0         [VLM]", "437 MB + 109 MB projector");
+        printf("  5.  Cancel\n\n");
+        printf("  Select [1-5]: ");
+        fflush(stdout);
+        char sel[16];
+        if (!fgets(sel, sizeof(sel), stdin)) return true;
+        int choice = atoi(sel);
+        struct DlEntry { const char * url; const char * fname; const char * proj_url; const char * proj_fname; };
+        DlEntry entries[] = {
+            { "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+              "Qwen3-0.6B-Q8_0.gguf", nullptr, nullptr },
+            { "https://huggingface.co/ggml-org/SmolLM3-3B-GGUF/resolve/main/SmolLM3-Q4_K_M.gguf",
+              "SmolLM3-Q4_K_M.gguf", nullptr, nullptr },
+            { "https://huggingface.co/ggml-org/SmolLM3-3B-GGUF/resolve/main/SmolLM3-Q8_0.gguf",
+              "SmolLM3-Q8_0.gguf", nullptr, nullptr },
+            { "https://huggingface.co/Mungert/SmolVLM-500M-Instruct-GGUF/resolve/main/SmolVLM-500M-Instruct-q8_0.gguf",
+              "SmolVLM-500M-Instruct-q8_0.gguf",
+              "https://huggingface.co/Mungert/SmolVLM-500M-Instruct-GGUF/resolve/main/SmolVLM-500M-Instruct-q8_0.mmproj",
+              "SmolVLM-500M-Instruct-q8_0.mmproj" },
+        };
+        if (choice < 1 || choice > 4) { tui::success("Cancelled"); return true; }
+        DlEntry & e = entries[choice - 1];
+        mkdir(".config", 0755);
+        mkdir(".config/models", 0755);
+        std::string dest = std::string(".config/models/") + e.fname;
+        FILE * check = fopen(dest.c_str(), "r");
+        if (check) { fclose(check); tui::success(("Already exists: " + dest).c_str()); return true; }
+        printf("\n  Downloading to %s ...\n", dest.c_str());
+        fflush(stdout);
+        std::string dl_cmd = std::string("curl -L --progress-bar -o \"") + dest + "\" \"" + e.url + "\"";
+        int ret = system(dl_cmd.c_str());
+        if (ret == 0) {
+            tui::success(("Downloaded: " + dest).c_str());
+            ec.model_path = dest;
+        } else {
+            tui::error("Download failed. Check your internet connection.");
+            return true;
+        }
+        // Download projector for VLM models
+        if (e.proj_url) {
+            std::string proj_dest = std::string(".config/models/") + e.proj_fname;
+            FILE * pcheck = fopen(proj_dest.c_str(), "r");
+            if (pcheck) { fclose(pcheck); tui::success(("Projector already exists: " + proj_dest).c_str()); }
+            else {
+                printf("  Downloading projector...\n");
+                std::string proj_cmd = std::string("curl -L --progress-bar -o \"") + proj_dest + "\" \"" + e.proj_url + "\"";
+                int pret = system(proj_cmd.c_str());
+                if (pret == 0) tui::success(("Projector downloaded: " + proj_dest).c_str());
+                else tui::error("Projector download failed.");
+            }
+        }
     }
     else tui::error("Unknown command. Type /help for available commands.");
     return true;
