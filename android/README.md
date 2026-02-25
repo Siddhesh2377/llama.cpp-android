@@ -20,6 +20,19 @@ Qwen3-0.6B Q8_0 on Snapdragon 7s Gen 3:
 curl -sL https://raw.githubusercontent.com/Siddhesh2377/llama.cpp-android/character-engine-v1/android/install.sh | bash
 ```
 
+The script will:
+1. Download the `gguf-engine-cli` binary from GitHub releases
+2. Download `aria.json` character config
+3. Ask which model to download (Qwen3-0.6B Q8_0, Q4_K_M, or skip)
+4. Push everything to device via ADB (or install locally)
+5. Generate `config.json` with defaults
+6. Print the run command
+
+```bash
+# Or run the install script manually
+bash install.sh
+```
+
 This downloads the binary + character config + optionally a model, pushes everything to your device, and prints the run command.
 
 ### Manual Run

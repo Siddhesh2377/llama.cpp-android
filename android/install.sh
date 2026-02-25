@@ -3,7 +3,7 @@
 # Downloads the standalone executable, character config, and optionally a model.
 #
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/anthropics/gguf-engine/main/install.sh | bash
+#   curl -sL https://raw.githubusercontent.com/Siddhesh2377/llama.cpp-android/character-engine-v1/android/install.sh | bash
 #   or: bash install.sh
 #
 # Requirements: curl, adb (for device push), or run directly on Android via Termux
@@ -12,7 +12,7 @@ set -e
 
 VERSION="1.0.0"
 INSTALL_DIR="${INSTALL_DIR:-/data/local/tmp}"
-REPO="anthropics/gguf-engine"  # Update with actual repo
+REPO="Siddhesh2377/llama.cpp-android"
 
 # Colors
 RED='\033[0;31m'
@@ -79,11 +79,11 @@ fi
 
 # Download binary
 echo -e "  ${BOLD}Step 1: Download gguf-engine binary${NC}"
-BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/gguf-forward-test-arm64"
-BINARY_PATH="${INSTALL_DIR}/gguf-forward-test-arm64"
+BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/gguf-engine-cli"
+BINARY_PATH="${INSTALL_DIR}/gguf-engine-cli"
 
 if [ "$MODE" = "adb" ]; then
-    BINARY_PATH="/tmp/gguf-forward-test-arm64"
+    BINARY_PATH="/tmp/gguf-engine-cli"
 fi
 
 if [ -f "$BINARY_PATH" ]; then
@@ -92,8 +92,8 @@ else
     info "Downloading from GitHub..."
     curl -L --progress-bar -o "$BINARY_PATH" "$BINARY_URL" 2>&1 || {
         warn "GitHub release not available, trying local build..."
-        if [ -f "./gguf-forward-test-arm64" ]; then
-            cp ./gguf-forward-test-arm64 "$BINARY_PATH"
+        if [ -f "./gguf-engine-cli" ]; then
+            cp ./gguf-engine-cli "$BINARY_PATH"
         else
             error "Binary not found. Build from source or check the release URL."
         fi
@@ -103,7 +103,7 @@ success "Binary ready"
 
 # Download character JSON
 echo -e "\n  ${BOLD}Step 2: Download character config${NC}"
-CHARACTER_URL="https://raw.githubusercontent.com/${REPO}/main/android/aria.json"
+CHARACTER_URL="https://raw.githubusercontent.com/${REPO}/character-engine-v1/android/aria.json"
 CHARACTER_PATH="${INSTALL_DIR}/aria.json"
 
 if [ "$MODE" = "adb" ]; then
@@ -184,9 +184,9 @@ esac
 # Push to device via ADB
 if [ "$MODE" = "adb" ]; then
     echo -e "\n  ${BOLD}Step 4: Push to device${NC}"
-    adb push /tmp/gguf-forward-test-arm64 /data/local/tmp/ 2>&1 | tail -1
+    adb push /tmp/gguf-engine-cli /data/local/tmp/ 2>&1 | tail -1
     adb push /tmp/aria.json /data/local/tmp/ 2>&1 | tail -1
-    adb shell "chmod +x /data/local/tmp/gguf-forward-test-arm64"
+    adb shell "chmod +x /data/local/tmp/gguf-engine-cli"
     if [ -n "$MODEL_PATH" ] && [ -f "$MODEL_PATH" ]; then
         info "Pushing model to device (this may take a while)..."
         adb push "$MODEL_PATH" /sdcard/Download/model.gguf 2>&1 | tail -1
@@ -247,7 +247,7 @@ echo -e "  ${BOLD}Quick start:${NC}"
 
 if [ "$MODE" = "adb" ]; then
     echo -e "    ${CYAN}adb shell${NC}"
-    echo -e "    ${CYAN}cd /data/local/tmp && LD_LIBRARY_PATH=. ./gguf-forward-test-arm64 \\${NC}"
+    echo -e "    ${CYAN}cd /data/local/tmp && LD_LIBRARY_PATH=. ./gguf-engine-cli \\${NC}"
     if [ -n "$MODEL_PATH" ]; then
         echo -e "    ${CYAN}  ${MODEL_PATH} --char-chat --ch-json aria.json${NC}"
     else
@@ -255,7 +255,7 @@ if [ "$MODE" = "adb" ]; then
     fi
 elif [ "$MODE" = "direct" ]; then
     echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
-    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-forward-test-arm64 \\${NC}"
+    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli \\${NC}"
     if [ -n "$MODEL_PATH" ]; then
         echo -e "    ${CYAN}  ${MODEL_PATH} --char-chat --ch-json aria.json${NC}"
     else
@@ -264,7 +264,7 @@ elif [ "$MODE" = "direct" ]; then
 else
     echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
     echo -e "    ${CYAN}# Push files to your Android device and run:${NC}"
-    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-forward-test-arm64 model.gguf --char-chat --ch-json aria.json${NC}"
+    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli model.gguf --char-chat --ch-json aria.json${NC}"
 fi
 
 echo ""
