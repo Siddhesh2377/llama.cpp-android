@@ -30,6 +30,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <sys/stat.h>
 
 using Clock = std::chrono::high_resolution_clock;
 
@@ -9136,8 +9137,9 @@ static bool handle_chat_command(
     else if (cmd == "save-config") {
         ec.temp = sp.temp; ec.top_k = sp.top_k; ec.top_p = sp.top_p;
         ec.rep_penalty = sp.rep_penalty; ec.max_tokens = max_tokens;
-        if (save_engine_config(ec, "config.json")) tui::success("Config saved to config.json");
-        else tui::error("Failed to save config.json");
+        mkdir(".config", 0755);
+        if (save_engine_config(ec, ".config/config.json")) tui::success("Config saved to .config/config.json");
+        else tui::error("Failed to save .config/config.json");
     }
     else if (cmd == "threads" && !arg.empty()) {
         int n = atoi(arg.c_str());
@@ -9494,7 +9496,7 @@ int main(int argc, char ** argv) {
 
     // Load config.json if present
     EngineConfig engine_config;
-    if (load_engine_config(engine_config, "config.json")) {
+    if (load_engine_config(engine_config, ".config/config.json")) {
         printf("  Loaded config.json\n");
     }
 

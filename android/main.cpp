@@ -187,10 +187,10 @@ int main(int argc, char ** argv) {
         if (is_version_flag(argv[i])) { print_version(); return 0; }
     }
 
-    // Load config.json if present
+    // Load .config/config.json if present
     EngineConfig engine_config;
-    if (load_engine_config(engine_config, "config.json")) {
-        printf("  Loaded config.json\n");
+    if (load_engine_config(engine_config, ".config/config.json")) {
+        printf("  Loaded .config/config.json\n");
     }
 
     const char * model_path = engine_config.model_path.empty() ? nullptr : engine_config.model_path.c_str();

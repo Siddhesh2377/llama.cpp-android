@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <sys/stat.h>
 
 // ---------------------------------------------------------------------------
 // System prompt tiers
@@ -452,7 +453,7 @@ bool handle_chat_command(
         tui::banner("Chat Commands");
         printf("  /help              Show this help\n");
         printf("  /config            Show current configuration\n");
-        printf("  /save-config       Save config to config.json\n");
+        printf("  /save-config       Save config to .config/config.json\n");
         printf("  /threads N         Set thread count (1-8)\n");
         printf("  /gpu N             Set GPU (0=off, 1=on)\n");
         printf("  /temp F            Set temperature (0.0-2.0)\n");
@@ -481,8 +482,10 @@ bool handle_chat_command(
     else if (cmd == "save-config") {
         ec.temp = sp.temp; ec.top_k = sp.top_k; ec.top_p = sp.top_p;
         ec.rep_penalty = sp.rep_penalty; ec.max_tokens = max_tokens;
-        if (save_engine_config(ec, "config.json")) tui::success("Config saved to config.json");
-        else tui::error("Failed to save config.json");
+        // Ensure .config/ directory exists
+        mkdir(".config", 0755);
+        if (save_engine_config(ec, ".config/config.json")) tui::success("Config saved to .config/config.json");
+        else tui::error("Failed to save .config/config.json");
     }
     else if (cmd == "threads" && !arg.empty()) {
         int n = atoi(arg.c_str());

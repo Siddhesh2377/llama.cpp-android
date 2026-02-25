@@ -7,11 +7,17 @@
 #   or: bash install.sh
 #
 # Requirements: curl, adb (for device push), or run directly on Android via Termux
+#
+# Layout:
+#   ./gguf-engine-cli          (binary)
+#   ./lib*.so                  (shared libraries)
+#   ./.config/config.json      (runtime config)
+#   ./.config/aria.json        (character personality)
+#   ./.config/models/model.gguf (downloaded model)
 
 set -e
 
 VERSION="1.0.0"
-INSTALL_DIR="${INSTALL_DIR:-/data/local/tmp}"
 REPO="Siddhesh2377/llama.cpp-android"
 
 # Colors
@@ -34,26 +40,6 @@ success() { echo -e "${GREEN}  ✓ $1${NC}"; }
 error() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 
-progress() {
-    local file="$1"
-    local total="$2"
-    local label="$3"
-    while [ ! -f "$file" ] || [ "$(wc -c < "$file" 2>/dev/null || echo 0)" -lt "$total" ]; do
-        local cur=$(wc -c < "$file" 2>/dev/null || echo 0)
-        local pct=$((cur * 100 / total))
-        printf "\r  ${CYAN}%s${NC} [" "$label"
-        local filled=$((pct * 30 / 100))
-        for i in $(seq 1 30); do
-            if [ "$i" -le "$filled" ]; then printf "${GREEN}█${NC}"; else printf " "; fi
-        done
-        printf "] ${YELLOW}%d%%${NC}" "$pct"
-        sleep 0.5
-    done
-    printf "\r  ${CYAN}%s${NC} [${GREEN}" "$label"
-    printf '█%.0s' $(seq 1 30)
-    printf "${NC}] ${GREEN}100%%${NC}\n"
-}
-
 header
 
 # Detect environment
@@ -70,14 +56,19 @@ else
     info "Detected: Desktop mode, downloading to ./gguf-engine"
 fi
 
+CONFIG_DIR="${INSTALL_DIR}/.config"
 echo ""
 
-# Create directory
+# Create directories
 if [ "$MODE" = "download" ] || [ "$MODE" = "direct" ]; then
     mkdir -p "$INSTALL_DIR"
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR/models"
 fi
 
-# Download binary
+# ===========================================================================
+# Step 1: Download binary
+# ===========================================================================
 echo -e "  ${BOLD}Step 1: Download gguf-engine binary${NC}"
 BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/gguf-engine-cli"
 BINARY_PATH="${INSTALL_DIR}/gguf-engine-cli"
@@ -102,8 +93,10 @@ fi
 chmod +x "$BINARY_PATH"
 success "Binary ready"
 
-# Download shared libraries
-echo -e "\n  ${BOLD}Step 1b: Download shared libraries${NC}"
+# ===========================================================================
+# Step 2: Download shared libraries
+# ===========================================================================
+echo -e "\n  ${BOLD}Step 2: Download shared libraries${NC}"
 LIBS_URL="https://github.com/${REPO}/releases/download/v${VERSION}/gguf-engine-libs-arm64.tar.gz"
 LIBS_DIR="$INSTALL_DIR"
 if [ "$MODE" = "adb" ]; then
@@ -124,13 +117,16 @@ else
     fi
 fi
 
-# Download character JSON
-echo -e "\n  ${BOLD}Step 2: Download character config${NC}"
+# ===========================================================================
+# Step 3: Download character config → .config/
+# ===========================================================================
+echo -e "\n  ${BOLD}Step 3: Download character config${NC}"
 CHARACTER_URL="https://raw.githubusercontent.com/${REPO}/character-engine-v1/android/aria.json"
-CHARACTER_PATH="${INSTALL_DIR}/aria.json"
 
 if [ "$MODE" = "adb" ]; then
     CHARACTER_PATH="/tmp/aria.json"
+else
+    CHARACTER_PATH="${CONFIG_DIR}/aria.json"
 fi
 
 if [ -f "$CHARACTER_PATH" ]; then
@@ -167,10 +163,12 @@ else
 ARIAEOF
     }
 fi
-success "Character config ready"
+success "Character config ready → .config/aria.json"
 
-# Download model (optional)
-echo -e "\n  ${BOLD}Step 3: Download model (optional)${NC}"
+# ===========================================================================
+# Step 4: Download model → .config/models/
+# ===========================================================================
+echo -e "\n  ${BOLD}Step 4: Download model (optional)${NC}"
 echo ""
 echo -e "  ${CYAN}Available models:${NC}"
 echo "    1) Qwen3-0.6B-Q8_0    (660 MB) — Best quality for 0.6B"
@@ -180,9 +178,10 @@ echo ""
 
 read -p "  Select [1/2/3]: " model_choice
 
-MODEL_PATH="${INSTALL_DIR}/model.gguf"
 if [ "$MODE" = "adb" ]; then
     MODEL_PATH="/tmp/model.gguf"
+else
+    MODEL_PATH="${CONFIG_DIR}/models/model.gguf"
 fi
 
 case "$model_choice" in
@@ -190,13 +189,13 @@ case "$model_choice" in
         MODEL_URL="https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q8_0.gguf"
         info "Downloading Qwen3-0.6B-Q8_0 (660 MB)..."
         curl -L --progress-bar -o "$MODEL_PATH" "$MODEL_URL"
-        success "Model downloaded"
+        success "Model downloaded → .config/models/model.gguf"
         ;;
     2)
         MODEL_URL="https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/qwen3-0.6b-q4_k_m.gguf"
         info "Downloading Qwen3-0.6B-Q4_K_M (430 MB)..."
         curl -L --progress-bar -o "$MODEL_PATH" "$MODEL_URL"
-        success "Model downloaded"
+        success "Model downloaded → .config/models/model.gguf"
         ;;
     *)
         warn "Skipping model download"
@@ -204,33 +203,50 @@ case "$model_choice" in
         ;;
 esac
 
-# Push to device via ADB
+# ===========================================================================
+# Step 5: Push to device via ADB
+# ===========================================================================
 if [ "$MODE" = "adb" ]; then
-    echo -e "\n  ${BOLD}Step 4: Push to device${NC}"
-    adb push /tmp/gguf-engine-cli /data/local/tmp/ 2>&1 | tail -1
+    echo -e "\n  ${BOLD}Step 5: Push to device${NC}"
+    INSTALL_DIR="/data/local/tmp"
+    CONFIG_DIR="${INSTALL_DIR}/.config"
+
+    # Create .config dirs on device
+    adb shell "mkdir -p ${CONFIG_DIR}/models" 2>/dev/null
+
+    # Push binary + libs to install dir
+    adb push /tmp/gguf-engine-cli ${INSTALL_DIR}/ 2>&1 | tail -1
     for lib in /tmp/libggml*.so; do
-        [ -f "$lib" ] && adb push "$lib" /data/local/tmp/ 2>&1 | tail -1
+        [ -f "$lib" ] && adb push "$lib" ${INSTALL_DIR}/ 2>&1 | tail -1
     done
-    adb push /tmp/aria.json /data/local/tmp/ 2>&1 | tail -1
-    adb shell "chmod +x /data/local/tmp/gguf-engine-cli"
+    adb shell "chmod +x ${INSTALL_DIR}/gguf-engine-cli"
+
+    # Push config to .config/
+    adb push /tmp/aria.json ${CONFIG_DIR}/ 2>&1 | tail -1
+
+    # Push model to .config/models/
     if [ -n "$MODEL_PATH" ] && [ -f "$MODEL_PATH" ]; then
         info "Pushing model to device (this may take a while)..."
-        adb push "$MODEL_PATH" /sdcard/Download/model.gguf 2>&1 | tail -1
+        adb push "$MODEL_PATH" ${CONFIG_DIR}/models/model.gguf 2>&1 | tail -1
+        MODEL_PATH="${CONFIG_DIR}/models/model.gguf"
+    else
+        MODEL_PATH=".config/models/model.gguf"
     fi
     success "Files pushed to device"
-    INSTALL_DIR="/data/local/tmp"
-    MODEL_PATH="/sdcard/Download/model.gguf"
 elif [ "$MODE" = "direct" ]; then
     chmod +x "$BINARY_PATH"
+    MODEL_PATH="${MODEL_PATH:-.config/models/model.gguf}"
 fi
 
-# Create default config.json
-CONFIG_PATH="${INSTALL_DIR}/config.json"
-if [ "$MODE" = "adb" ]; then
-    CONFIG_CONTENT=$(cat << CONFEOF
+# ===========================================================================
+# Step 6: Create .config/config.json
+# ===========================================================================
+echo -e "\n  ${BOLD}Step 6: Create config${NC}"
+
+CONFIG_JSON=$(cat << CONFEOF
 {
-    "model_path": "${MODEL_PATH:-/sdcard/Download/model.gguf}",
-    "character_json": "aria.json",
+    "model_path": "${MODEL_PATH:-.config/models/model.gguf}",
+    "character_json": ".config/aria.json",
     "threads": 4,
     "gpu": 0,
     "max_tokens": 256,
@@ -244,55 +260,42 @@ if [ "$MODE" = "adb" ]; then
 }
 CONFEOF
 )
-    echo "$CONFIG_CONTENT" | adb shell "cat > ${INSTALL_DIR}/config.json"
-else
-    cat > "$CONFIG_PATH" << CONFEOF
-{
-    "model_path": "${MODEL_PATH:-model.gguf}",
-    "character_json": "aria.json",
-    "threads": 4,
-    "gpu": 0,
-    "max_tokens": 256,
-    "max_ctx": 2048,
-    "temp": 0.85,
-    "top_k": 50,
-    "top_p": 0.93,
-    "rep_penalty": 1.20,
-    "color": 1,
-    "verbose": 0
-}
-CONFEOF
-fi
-success "Config created"
 
+if [ "$MODE" = "adb" ]; then
+    echo "$CONFIG_JSON" | adb shell "cat > ${CONFIG_DIR}/config.json"
+else
+    echo "$CONFIG_JSON" > "${CONFIG_DIR}/config.json"
+fi
+success "Config created → .config/config.json"
+
+# ===========================================================================
 # Done
+# ===========================================================================
 echo ""
 echo -e "  ${BOLD}${GREEN}Installation complete!${NC}"
+echo ""
+echo -e "  ${DIM}Layout:${NC}"
+echo -e "  ${DIM}  ./gguf-engine-cli          binary${NC}"
+echo -e "  ${DIM}  ./lib*.so                  shared libraries${NC}"
+echo -e "  ${DIM}  ./.config/config.json      settings${NC}"
+echo -e "  ${DIM}  ./.config/aria.json        character${NC}"
+echo -e "  ${DIM}  ./.config/models/          models${NC}"
 echo ""
 echo -e "  ${BOLD}Quick start:${NC}"
 
 if [ "$MODE" = "adb" ]; then
     echo -e "    ${CYAN}adb shell${NC}"
-    echo -e "    ${CYAN}cd /data/local/tmp && LD_LIBRARY_PATH=. ./gguf-engine-cli \\${NC}"
-    if [ -n "$MODEL_PATH" ]; then
-        echo -e "    ${CYAN}  ${MODEL_PATH} --char-chat --ch-json aria.json${NC}"
-    else
-        echo -e "    ${CYAN}  /path/to/model.gguf --char-chat --ch-json aria.json${NC}"
-    fi
+    echo -e "    ${CYAN}cd ${INSTALL_DIR} && LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
 elif [ "$MODE" = "direct" ]; then
     echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
-    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli \\${NC}"
-    if [ -n "$MODEL_PATH" ]; then
-        echo -e "    ${CYAN}  ${MODEL_PATH} --char-chat --ch-json aria.json${NC}"
-    else
-        echo -e "    ${CYAN}  model.gguf --char-chat --ch-json aria.json${NC}"
-    fi
+    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
 else
     echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
-    echo -e "    ${CYAN}# Push files to your Android device and run:${NC}"
-    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli model.gguf --char-chat --ch-json aria.json${NC}"
+    echo -e "    ${CYAN}# Push to device, then:${NC}"
+    echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
 fi
 
 echo ""
+echo -e "  ${DIM}All config in .config/ — model path + character auto-loaded from config.json${NC}"
 echo -e "  ${DIM}Type /help in chat for available commands${NC}"
 echo ""
