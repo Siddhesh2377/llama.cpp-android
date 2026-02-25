@@ -2,7 +2,7 @@
 # gguf-engine installer for Android (aarch64)
 #
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/.../install.sh | bash
+#   curl -sL https://raw.githubusercontent.com/Siddhesh2377/llama.cpp-android/character-engine/android/install.sh | bash
 #   or: bash install.sh
 #
 # Requirements: curl, adb (for device push), or run directly on Android via Termux
