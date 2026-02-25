@@ -47,27 +47,24 @@ echo -e "  ${BOLD}${CYAN}└─────────────────�
 echo ""
 
 # ── Detect environment ──────────────────────────────────────────────────────
+# Everything installs to ./gguf-engine in the current directory. Always.
+INSTALL_DIR="./gguf-engine"
+
 if [ -d "/data/local/tmp" ] && [ "$(uname -m)" = "aarch64" ]; then
     MODE="direct"
-    INSTALL_DIR="/data/local/tmp/gguf-engine"
     TOTAL_STEPS=4
     info "Environment : Android (aarch64)"
-    info "Install dir : ${CYAN}${INSTALL_DIR}${NC}"
 elif command -v adb &>/dev/null; then
     MODE="adb"
-    INSTALL_DIR="./gguf-engine"
-    DEVICE_DIR="/data/local/tmp/gguf-engine"
     TOTAL_STEPS=5
     info "Environment : Desktop + ADB"
-    info "Download to : ${CYAN}${INSTALL_DIR}${NC}"
-    info "Push to     : ${CYAN}${DEVICE_DIR}${NC}"
 else
     MODE="download"
-    INSTALL_DIR="./gguf-engine"
     TOTAL_STEPS=4
-    info "Environment : Desktop (no ADB)"
-    info "Install dir : ${CYAN}${INSTALL_DIR}${NC}"
+    info "Environment : Desktop"
 fi
+
+info "Install dir : ${CYAN}${INSTALL_DIR}${NC}"
 
 CONFIG_DIR="${INSTALL_DIR}/.config"
 
@@ -184,6 +181,11 @@ success "Config created → .config/config.json"
 if [ "$MODE" = "adb" ]; then
     step 5 "Push to device via ADB"
 
+    echo ""
+    echo -e "  ${DIM}Where on device? (default: /data/local/tmp/gguf-engine)${NC}"
+    read -p "  Device path: " device_path
+    DEVICE_DIR="${device_path:-/data/local/tmp/gguf-engine}"
+
     adb shell "mkdir -p ${DEVICE_DIR}/.config/models" 2>/dev/null
 
     info "Pushing binary..."
@@ -200,7 +202,6 @@ if [ "$MODE" = "adb" ]; then
     adb push "${CONFIG_DIR}/aria.json" "${DEVICE_DIR}/.config/" 2>&1 | tail -1
 
     success "All files pushed → ${DEVICE_DIR}"
-    INSTALL_DIR="$DEVICE_DIR"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -225,7 +226,7 @@ echo ""
 
 if [ "$MODE" = "adb" ]; then
     echo -e "    ${CYAN}adb shell${NC}"
-    echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
+    echo -e "    ${CYAN}cd ${DEVICE_DIR}${NC}"
     echo -e "    ${CYAN}LD_LIBRARY_PATH=. ./gguf-engine-cli --char-chat${NC}"
 else
     echo -e "    ${CYAN}cd ${INSTALL_DIR}${NC}"
