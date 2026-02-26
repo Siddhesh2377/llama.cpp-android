@@ -1,5 +1,5 @@
 <script lang="ts">
-	import AppShell from '$lib/components/AppShell.svelte';
+	import Workspace from '$lib/layout/Workspace.svelte';
 	import '../app.css';
 </script>
 
@@ -7,4 +7,4 @@
 	<title>AutoMatrix | Visual ML IDE</title>
 </svelte:head>
 
-<AppShell />
+<Workspace />
