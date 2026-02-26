@@ -29,6 +29,40 @@
   --info: #5a8ec4;
   --info-dim: #5a8ec433;
 
+  /* Node category colors */
+  --node-embed-bg: #1a3a4d;
+  --node-embed-accent: #6ec6ff;
+  --node-attn-bg: #3d2a14;
+  --node-attn-accent: #e8963a;
+  --node-ffn-bg: #3a1f3d;
+  --node-ffn-accent: #ce93d8;
+  --node-norm-bg: #1f3a25;
+  --node-norm-accent: #a5d6a7;
+  --node-head-bg: #3d1a1a;
+  --node-head-accent: #ef5350;
+  --node-math-bg: #2a1f3d;
+  --node-math-accent: #ba68c8;
+  --node-device-bg: #3d3a1a;
+  --node-device-accent: #ffd54f;
+  --node-memory-bg: #3d1a1a;
+  --node-memory-accent: #ef5350;
+  --node-custom-bg: #2a2a2a;
+  --node-custom-accent: #8a7e74;
+
+  /* Pin type colors */
+  --pin-tensor: #e8963a;
+  --pin-image: #4fc3f7;
+  --pin-tokens: #81c784;
+  --pin-kv-cache: #ffb74d;
+  --pin-scalar: #64b5f6;
+  --pin-math: #ba68c8;
+  --pin-config: #a1887f;
+  --pin-flow: #ffffff;
+  --pin-memory: #ef5350;
+  --pin-device: #ffd54f;
+  --pin-stream: #4db6ac;
+  --pin-binary: #78909c;
+
   --font-mono: 'JetBrains Mono', 'IBM Plex Mono', 'Consolas', monospace;
   --font-size-xs: 10px;
   --font-size-sm: 11px;
@@ -85,6 +119,29 @@
   --success-dim: #3a885522;
   --error: #b04040;
   --error-dim: #b0404022;
+
+  /* Node category colors */
+  --node-embed-bg: #e3f2fd;
+  --node-embed-accent: #1976d2;
+  --node-attn-bg: #fff3e0;
+  --node-attn-accent: #e65100;
+  --node-ffn-bg: #f3e5f5;
+  --node-ffn-accent: #7b1fa2;
+  --node-norm-bg: #e8f5e9;
+  --node-norm-accent: #2e7d32;
+  --node-head-bg: #ffebee;
+  --node-head-accent: #c62828;
+  --node-math-bg: #ede7f6;
+  --node-math-accent: #6a1b9a;
+  --node-device-bg: #fffde7;
+  --node-device-accent: #f57f17;
+  --node-memory-bg: #ffebee;
+  --node-memory-accent: #b71c1c;
+  --node-custom-bg: #f5f5f5;
+  --node-custom-accent: #616161;
+
+  /* Pin type colors */
+  --pin-flow: #333333;
 
   color-scheme: light;
 }
