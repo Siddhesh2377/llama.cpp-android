@@ -22,14 +22,28 @@
 	import SettingsPanel from '$lib/components/SettingsPanel.svelte';
 	import NodeCanvas from '$lib/engine/NodeCanvas.svelte';
 
-	import { documents, activeDocId } from '$lib/engine/store';
+	import { documents, activeDocId, openDocument } from '$lib/engine/store';
+	import { modelToBpDocument } from '$lib/engine/model-to-graph';
 	import { devices } from '$lib/stores/device';
-	import { startPolling, stopPolling, getPlugins } from '$lib/api/client';
+	import { startPolling, stopPolling, getPlugins, getModelInfo, getModelGraph } from '$lib/api/client';
 	import { consoleStore } from '$lib/stores/console';
+	import { model } from '$lib/stores/model';
 	import { plugins } from '$lib/stores/plugins';
 	import { theme, zoom, showConsole } from '$lib/stores/settings';
 	import { onMount, onDestroy } from 'svelte';
 	import { browser } from '$app/environment';
+
+	let unsubModel: (() => void) | null = null;
+
+	async function openModelGraph() {
+		const info = await getModelInfo();
+		const graph = await getModelGraph();
+		if (info && graph) {
+			const doc = modelToBpDocument(info, graph);
+			openDocument(doc);
+			consoleStore.info(`Opened model graph: ${doc.name}`, 'editor');
+		}
+	}
 
 	onMount(() => {
 		if (browser) {
@@ -53,10 +67,18 @@
 
 		// Sync showConsole with bottom window state
 		showConsole.set(true);
+
+		// Auto-open model graph when a model is loaded
+		unsubModel = model.subscribe(m => {
+			if (m) {
+				setTimeout(() => openModelGraph(), 100);
+			}
+		});
 	});
 
 	onDestroy(() => {
 		stopPolling();
+		if (unsubModel) unsubModel();
 	});
 
 	// Action stubs
