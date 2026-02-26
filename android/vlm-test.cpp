@@ -50,6 +50,58 @@
 #include <numeric>
 #include <chrono>
 #include <random>
+#include <map>
+
+// ===========================================================================
+// Helper: auto-detect big.LITTLE and set OMP affinity to big cores
+// Must be called BEFORE any OpenMP code (before ggml_backend_load_all)
+// ===========================================================================
+static void setup_omp_big_core_affinity() {
+    // Detect CPU core frequencies from sysfs
+    struct CoreInfo { int id; long freq_khz; };
+    std::vector<CoreInfo> cores;
+    for (int i = 0; i < 16; i++) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        FILE * f = fopen(path, "r");
+        if (!f) break;
+        long freq = 0;
+        if (fscanf(f, "%ld", &freq) == 1) {
+            cores.push_back({i, freq});
+        }
+        fclose(f);
+    }
+
+    if (cores.size() < 2) return;
+
+    // Sort by frequency descending
+    std::sort(cores.begin(), cores.end(),
+              [](const CoreInfo & a, const CoreInfo & b) { return a.freq_khz > b.freq_khz; });
+
+    // Big cores: freq >= 80% of fastest
+    long max_freq = cores[0].freq_khz;
+    long threshold = max_freq * 80 / 100;
+
+    // Build OMP_PLACES string: "{4},{5},{6},{7}" format
+    std::string places;
+    int n_big = 0;
+    for (auto & c : cores) {
+        if (c.freq_khz >= threshold) {
+            if (!places.empty()) places += ",";
+            places += "{" + std::to_string(c.id) + "}";
+            n_big++;
+        }
+    }
+
+    if (n_big < 2) return;  // not a big.LITTLE layout
+
+    setenv("OMP_PLACES", places.c_str(), 0);  // 0 = don't override existing
+    setenv("OMP_PROC_BIND", "close", 0);
+
+    fprintf(stderr, "  [OMP AFFINITY] big.LITTLE detected: %d big cores, OMP_PLACES=%s\n",
+            n_big, places.c_str());
+}
 
 // ===========================================================================
 // Helper: set CPU thread count (copied from main.cpp — local to this file)
@@ -61,9 +113,10 @@ static void set_cpu_threads(ggml_backend_t backend, int n_threads) {
     if (!reg) return;
     typedef void (*set_n_threads_fn_t)(ggml_backend_t, int);
     auto fn = (set_n_threads_fn_t)ggml_backend_reg_get_proc_address(
-        reg, "ggml_backend_cpu_set_n_threads");
+        reg, "ggml_backend_set_n_threads");
     if (fn) fn(backend, n_threads);
 }
+
 
 // ===========================================================================
 // Special token finder — search vocab for exact string match
@@ -294,14 +347,30 @@ static struct ggml_cgraph * build_vlm_prefill_graph(
             cur = ggml_mul(ctx, cur, lw.attn_norm);
         }
 
-        // QKV projections
-        struct ggml_tensor * Q = ggml_mul_mat(ctx, lw.attn_q, cur);
-        struct ggml_tensor * K = ggml_mul_mat(ctx, lw.attn_k, cur);
-        struct ggml_tensor * V = ggml_mul_mat(ctx, lw.attn_v, cur);
+        // QKV projections — fused or individual
+        const int q_out  = n_head * head_dim;
+        const int kv_out = n_head_kv * head_dim;
+        const int n_ff   = (int)cfg.n_ff;
 
-        Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, seq_len);
-        K = ggml_reshape_3d(ctx, K, head_dim, n_head_kv, seq_len);
-        V = ggml_reshape_3d(ctx, V, head_dim, n_head_kv, seq_len);
+        struct ggml_tensor * Q, * K, * V;
+        if (lw.attn_qkv) {
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx, lw.attn_qkv, cur);
+            int n_total_heads = n_head + 2 * n_head_kv;
+            qkv = ggml_reshape_3d(ctx, qkv, head_dim, n_total_heads, seq_len);
+            Q = ggml_view_3d(ctx, qkv, head_dim, n_head, seq_len,
+                qkv->nb[1], qkv->nb[2], 0);
+            K = ggml_view_3d(ctx, qkv, head_dim, n_head_kv, seq_len,
+                qkv->nb[1], qkv->nb[2], (size_t)n_head * qkv->nb[1]);
+            V = ggml_view_3d(ctx, qkv, head_dim, n_head_kv, seq_len,
+                qkv->nb[1], qkv->nb[2], (size_t)(n_head + n_head_kv) * qkv->nb[1]);
+        } else {
+            Q = ggml_mul_mat(ctx, lw.attn_q, cur);
+            K = ggml_mul_mat(ctx, lw.attn_k, cur);
+            V = ggml_mul_mat(ctx, lw.attn_v, cur);
+            Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, seq_len);
+            K = ggml_reshape_3d(ctx, K, head_dim, n_head_kv, seq_len);
+            V = ggml_reshape_3d(ctx, V, head_dim, n_head_kv, seq_len);
+        }
 
         // Optional Q/K norm (Gemma3)
         if (cfg.has_qk_norm && lw.q_norm && lw.k_norm) {
@@ -354,8 +423,9 @@ static struct ggml_cgraph * build_vlm_prefill_graph(
         struct ggml_tensor * attn_out = ggml_flash_attn_ext(ctx,
             Q_perm, K_full, V_full, attn_mask, base_scale, 0.0f, 0.0f);
 
+        // flash_attn_ext output is a fresh contiguous tensor — no cont needed
         struct ggml_tensor * attn_merged = ggml_reshape_2d(ctx,
-            ggml_cont(ctx, attn_out), n_embd_head, seq_len);
+            attn_out, n_embd_head, seq_len);
 
         // Output projection
         cur = ggml_mul_mat(ctx, lw.attn_output, attn_merged);
@@ -373,13 +443,25 @@ static struct ggml_cgraph * build_vlm_prefill_graph(
             cur = ggml_mul(ctx, cur, lw.ffn_norm);
         }
 
-        struct ggml_tensor * gate_proj = ggml_mul_mat(ctx, lw.ffn_gate, cur);
+        // Gated FFN — fused or individual
+        struct ggml_tensor * gate_proj, * up_proj;
+        if (lw.ffn_gate_up) {
+            struct ggml_tensor * gu = ggml_mul_mat(ctx, lw.ffn_gate_up, cur);
+            gate_proj = ggml_cont(ctx,
+                ggml_view_2d(ctx, gu, n_ff, seq_len, gu->nb[1], 0));
+            up_proj = ggml_cont(ctx,
+                ggml_view_2d(ctx, gu, n_ff, seq_len, gu->nb[1],
+                    n_ff * ggml_element_size(gu)));
+        } else {
+            gate_proj = ggml_mul_mat(ctx, lw.ffn_gate, cur);
+            up_proj   = ggml_mul_mat(ctx, lw.ffn_up, cur);
+        }
+
         struct ggml_tensor * gate = cfg.use_gelu
             ? ggml_gelu(ctx, gate_proj)
             : ggml_silu(ctx, gate_proj);
-        struct ggml_tensor * up = ggml_mul_mat(ctx, lw.ffn_up, cur);
-        struct ggml_tensor * gate_up = ggml_mul(ctx, gate, up);
-        cur = ggml_mul_mat(ctx, lw.ffn_down, gate_up);
+        struct ggml_tensor * gate_up_mul = ggml_mul(ctx, gate, up_proj);
+        cur = ggml_mul_mat(ctx, lw.ffn_down, gate_up_mul);
 
         // FFN residual
         cur = ggml_add(ctx, cur, ffn_residual);
@@ -409,7 +491,7 @@ static struct ggml_cgraph * build_vlm_prefill_graph(
 
 // Context size for VLM prefill graph
 static size_t vlm_prefill_ctx_size(int n_layers) {
-    int n_tensors = n_layers * 35 + 20;
+    int n_tensors = n_layers * 40 + 20;
     return (size_t)n_tensors * ggml_tensor_overhead() +
            ggml_graph_overhead_custom(2048, false);
 }
@@ -462,6 +544,11 @@ struct VLMTestConfig {
     int max_tokens = 64;
     const char * prompt = "Describe this image in detail.";
     bool verbose = false;
+    bool use_gpu = false;   // --gpu: load weights/KV on GPU, direct GPU compute
+    ggml_type quant = GGML_TYPE_COUNT;  // --q4: runtime requantize to Q4_0
+    ggml_type quant_ffn = GGML_TYPE_COUNT;  // --mixed: FFN-only quant
+    int vlayers = -1;  // --vlayers: override vision layer count (-1 = all)
+    int image_size = 0; // --image-size: override vision resolution (0 = model default)
 };
 
 static void print_usage(const char * prog) {
@@ -474,6 +561,13 @@ static void print_usage(const char * prog) {
     printf("  --max-tokens N     Max tokens to generate (default: 32)\n");
     printf("  --image PATH       Image file to test with (JPG/PNG, default: synthetic)\n");
     printf("  --prompt TEXT      User prompt (default: \"Describe this image...\")\n");
+    printf("  --gpu              Use GPU for LLM (direct compute, no scheduler)\n");
+    printf("  --q4               Requantize weights to Q4_0 (half bandwidth)\n");
+    printf("  --q4_1             Requantize weights to Q4_1\n");
+    printf("  --q5               Requantize weights to Q5_0\n");
+    printf("  --q5_1             Requantize weights to Q5_1\n");
+    printf("  --mixed            Mixed quant: attention Q8_0, FFN Q4_0\n");
+    printf("  --mixed5           Mixed quant: attention Q8_0, FFN Q5_0\n");
     printf("  --verbose          Extra tensor dumps\n");
     printf("\nExample:\n");
     printf("  %s --model /sdcard/Download/SmolVLM-500M-Instruct-q8_0.gguf \\\n", prog);
@@ -494,6 +588,24 @@ static bool parse_args(int argc, char ** argv, VLMTestConfig & cfg) {
             cfg.image_path = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             cfg.prompt = argv[++i];
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            cfg.use_gpu = true;
+        } else if (strcmp(argv[i], "--q4") == 0) {
+            cfg.quant = GGML_TYPE_Q4_0;
+        } else if (strcmp(argv[i], "--q4_1") == 0) {
+            cfg.quant = GGML_TYPE_Q4_1;
+        } else if (strcmp(argv[i], "--q5") == 0) {
+            cfg.quant = GGML_TYPE_Q5_0;
+        } else if (strcmp(argv[i], "--q5_1") == 0) {
+            cfg.quant = GGML_TYPE_Q5_1;
+        } else if (strcmp(argv[i], "--mixed") == 0) {
+            cfg.quant_ffn = GGML_TYPE_Q4_0;
+        } else if (strcmp(argv[i], "--mixed5") == 0) {
+            cfg.quant_ffn = GGML_TYPE_Q5_0;
+        } else if (strcmp(argv[i], "--vlayers") == 0 && i + 1 < argc) {
+            cfg.vlayers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--image-size") == 0 && i + 1 < argc) {
+            cfg.image_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verbose") == 0) {
             cfg.verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -516,39 +628,100 @@ static bool parse_args(int argc, char ** argv, VLMTestConfig & cfg) {
 // ===========================================================================
 // Stage 1: Backend init
 // ===========================================================================
-static ggml_backend_t init_backend(int n_threads) {
+struct Backends {
+    ggml_backend_t cpu = nullptr;
+    ggml_backend_t gpu = nullptr;
+};
+
+static Backends init_backends(int n_threads) {
     LOG_SECTION("STAGE 1: Backend Initialization");
     Timer t;
 
     ggml_backend_load_all();
 
-    ggml_backend_t backend = ggml_backend_init_by_type(
-        GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!backend) {
-        LOG_FAIL("CPU backend init failed");
-        return nullptr;
-    }
+    Backends be;
 
-    set_cpu_threads(backend, n_threads);
+    // CPU backend (always available)
+    be.cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!be.cpu) {
+        LOG_FAIL("CPU backend init failed");
+        return be;
+    }
+    set_cpu_threads(be.cpu, n_threads);
 
     LOG_SUBSECTION("CPU Backend");
-    LOG_KV("backend", "%s", ggml_backend_name(backend));
+    LOG_KV("backend", "%s", ggml_backend_name(be.cpu));
     LOG_KV("threads", "%d", n_threads);
-    LOG_KV("init time", "%.1f ms", t.ms());
+    const char * omp_places = getenv("OMP_PLACES");
+    LOG_KV("affinity", "%s", omp_places ? omp_places : "default");
     LOG_END();
 
-    return backend;
+    // GPU backend (optional — OpenCL/Adreno)
+    be.gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (be.gpu) {
+        LOG_SUBSECTION("GPU Backend");
+        LOG_KV("backend", "%s", ggml_backend_name(be.gpu));
+        auto * dev = ggml_backend_get_device(be.gpu);
+        if (dev) {
+            LOG_KV("device", "%s", ggml_backend_dev_description(dev));
+        }
+        LOG_END();
+    } else {
+        LOG_SUBSECTION("GPU Backend");
+        LOG_KV("status", "not available (CPU-only mode)");
+        LOG_END();
+    }
+
+    LOG_SUBSECTION("Init Summary");
+    LOG_KV("init time", "%.1f ms", t.ms());
+    LOG_KV("mode", "%s", be.gpu ? "CPU + GPU" : "CPU only");
+    LOG_END();
+
+    return be;
+}
+
+// ===========================================================================
+// Fast CPU-side token embedding lookup (reads from mmap, bypasses GPU)
+// ===========================================================================
+static void lookup_token_embedding(ModelState & state, int token_id,
+                                    float * out_f32, int n_embd) {
+    // Read directly from mmap'd GGUF data (CPU memory) — O(1), no GPU transfer
+    struct ggml_tensor * src = ggml_get_tensor(state.data_ctx, "token_embd.weight");
+    if (!src) return;
+    size_t row_bytes = ggml_row_size(src->type, n_embd);
+    const uint8_t * row_ptr = (const uint8_t *)src->data + (size_t)token_id * row_bytes;
+    ggml_get_type_traits(src->type)->to_float(row_ptr, out_f32, n_embd);
+}
+
+// ===========================================================================
+// LLM scheduler — GPU primary, CPU fallback
+// ===========================================================================
+static ggml_backend_sched_t create_llm_sched(const Backends & be, int graph_size = 2048) {
+    if (be.gpu) {
+        ggml_backend_t backends[] = { be.gpu, be.cpu };
+        ggml_backend_buffer_type_t buftypes[] = {
+            ggml_backend_get_default_buffer_type(be.gpu),
+            ggml_backend_get_default_buffer_type(be.cpu),
+        };
+        return ggml_backend_sched_new(backends, buftypes, 2, graph_size, false, true);
+    }
+    ggml_backend_t backends[] = { be.cpu };
+    ggml_backend_buffer_type_t buftypes[] = {
+        ggml_backend_get_default_buffer_type(be.cpu),
+    };
+    return ggml_backend_sched_new(backends, buftypes, 1, graph_size, false, true);
 }
 
 // ===========================================================================
 // Stage 2: Load LLM
 // ===========================================================================
 static bool load_llm(ModelState & state, const char * path, ggml_backend_t backend,
-                     bool verbose) {
+                     bool verbose, ggml_type quant_type = GGML_TYPE_COUNT,
+                     ggml_type quant_ffn = GGML_TYPE_COUNT) {
     LOG_SECTION("STAGE 2: LLM Model Loading");
     Timer t;
 
-    if (!load_model(state, path, -1, backend)) {
+    if (!load_model(state, path, -1, backend, quant_type, quant_ffn)) {
         LOG_FAIL("LLM load failed");
         return false;
     }
@@ -580,12 +753,10 @@ static bool load_llm(ModelState & state, const char * path, ggml_backend_t backe
     log_tensor("output_norm", state.output_norm);
     log_tensor("output", state.output);
     log_tensor("attn_norm", state.layers[0].attn_norm);
-    log_tensor("attn_q", state.layers[0].attn_q);
-    log_tensor("attn_k", state.layers[0].attn_k);
-    log_tensor("attn_v", state.layers[0].attn_v);
+    log_tensor("attn_qkv", state.layers[0].attn_qkv);
     log_tensor("attn_output", state.layers[0].attn_output);
-    log_tensor("ffn_gate", state.layers[0].ffn_gate);
-    log_tensor("ffn_up", state.layers[0].ffn_up);
+    log_tensor("ffn_norm", state.layers[0].ffn_norm);
+    log_tensor("ffn_gate_up", state.layers[0].ffn_gate_up);
     log_tensor("ffn_down", state.layers[0].ffn_down);
     LOG_END();
 
@@ -606,7 +777,7 @@ static bool load_vision(VisionModelState & vs, const char * path,
     LOG_SECTION("STAGE 3: Vision Model Loading");
     Timer t;
 
-    if (!load_vision_model(vs, path, backend)) {
+    if (!load_vision_model(vs, path, backend, true /*quantize F16→Q8_0*/)) {
         LOG_FAIL("Vision model load failed");
         return false;
     }
@@ -649,11 +820,19 @@ static bool setup_kv_cache(ModelState & state, ggml_backend_t backend) {
 // ===========================================================================
 // Stage 5: Vision encode
 // ===========================================================================
-static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
+static bool run_vision_encode(VisionModelState & vs, const Backends & be,
                               std::vector<float> & vision_embeds_out,
                               int & n_vision_tokens, int & vision_dim,
-                              const char * image_path, bool verbose) {
+                              const char * image_path, bool verbose,
+                              int vlayers = -1, int image_size_override = 0) {
     LOG_SECTION("STAGE 5: Vision Encode");
+
+    // Use scheduler for hybrid GPU+CPU compute when GPU is available
+    bool vision_on_gpu = be.gpu && vs.weight_buf &&
+        ggml_backend_supports_buft(be.gpu, ggml_backend_buffer_get_type(vs.weight_buf));
+    ggml_backend_t compute_backend = vision_on_gpu ? be.gpu : be.cpu;
+    bool use_sched = vision_on_gpu; // scheduler for GPU+CPU hybrid
+    const char * backend_name = use_sched ? "GPU+CPU sched" : "CPU";
 
     LOG_SUBSECTION("Image Preprocessing");
     Timer t;
@@ -661,8 +840,14 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
     // SigLIP normalization params
     float mean[3] = {0.5f, 0.5f, 0.5f};
     float std_val[3] = {0.5f, 0.5f, 0.5f};
-    int image_size = 512;  // SmolVLM default
+    int image_size = (image_size_override > 0) ? image_size_override : 512;
 
+    // Override the model's native image size for variable resolution
+    if (image_size_override > 0) {
+        set_vision_image_size((uint32_t)image_size_override);
+    }
+
+    LOG_KV("compute backend", "%s (%s)", backend_name, ggml_backend_name(compute_backend));
     LOG_KV("image_size", "%dx%d", image_size, image_size);
     LOG_KV("normalization", "mean=[%.1f,%.1f,%.1f] std=[%.1f,%.1f,%.1f]",
         mean[0], mean[1], mean[2], std_val[0], std_val[1], std_val[2]);
@@ -690,15 +875,13 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
     LOG_SUBSECTION("Vision Graph");
     t.reset();
 
-    // Context for graph building
-    // Vision: 12 layers * ~25 tensors + 20 global = ~320 tensors
     int n_tensors_est = 400;
     size_t ctx_size = (size_t)n_tensors_est * ggml_tensor_overhead() +
                       ggml_graph_overhead_custom(4096, false);
     struct ggml_init_params params = { ctx_size, nullptr, true };
     struct ggml_context * ctx = ggml_init(params);
 
-    struct ggml_cgraph * graph = build_vision_graph(ctx, vs);
+    struct ggml_cgraph * graph = build_vision_graph(ctx, vs, vlayers);
     if (!graph) {
         LOG_FAIL("Vision graph build failed");
         ggml_free(ctx);
@@ -706,22 +889,43 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
     }
 
     LOG_KV("graph nodes", "%d", ggml_graph_n_nodes(graph));
-    LOG_KV("graph leafs", "%d", ggml_graph_n_nodes(graph));
     LOG_KV("build time", "%.1f ms", t.ms());
 
     // Allocate graph
     t.reset();
-    ggml_gallocr_t galloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
-        LOG_FAIL("Vision graph alloc failed");
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx);
-        return false;
+
+    ggml_gallocr_t galloc = nullptr;
+    ggml_backend_sched_t vision_sched = nullptr;
+
+    if (use_sched) {
+        // Scheduler: GPU primary (weights are there), CPU fallback for unsupported ops
+        ggml_backend_t backends[] = { be.gpu, be.cpu };
+        ggml_backend_buffer_type_t buftypes[] = {
+            ggml_backend_get_default_buffer_type(be.gpu),
+            ggml_backend_get_default_buffer_type(be.cpu),
+        };
+        vision_sched = ggml_backend_sched_new(backends, buftypes, 2, 4096, false, true);
+        if (!ggml_backend_sched_alloc_graph(vision_sched, graph)) {
+            LOG_FAIL("Vision graph sched alloc failed");
+            ggml_backend_sched_free(vision_sched);
+            ggml_free(ctx);
+            return false;
+        }
+        LOG_KV("allocation", "GPU+CPU scheduler");
+    } else {
+        galloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(compute_backend));
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+            LOG_FAIL("Vision graph alloc failed (%s)", backend_name);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx);
+            return false;
+        }
+        LOG_KV("allocation", "%s direct", backend_name);
+        LOG_KV("compute buffer", "%.2f MB",
+            ggml_gallocr_get_buffer_size(galloc, 0) / 1024.0 / 1024.0);
     }
 
-    LOG_KV("compute buffer", "%.2f MB",
-        ggml_gallocr_get_buffer_size(galloc, 0) / 1024.0 / 1024.0);
     LOG_KV("alloc time", "%.1f ms", t.ms());
     LOG_END();
 
@@ -732,7 +936,8 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
     struct ggml_tensor * inp_pixels = ggml_graph_get_tensor(graph, "inp_pixels");
     if (!inp_pixels) {
         LOG_FAIL("inp_pixels tensor not found in graph");
-        ggml_gallocr_free(galloc);
+
+        if (galloc) ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return false;
     }
@@ -748,21 +953,133 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
             mask_size * sizeof(uint16_t));
     }
 
+    // Fill interpolated position embeddings for variable resolution
+    struct ggml_tensor * inp_pos = ggml_graph_get_tensor(graph, "inp_pos_embd");
+    if (inp_pos && vs.pos_embd) {
+        // Bilinear interpolation of 2D position embeddings
+        // pos_embd is [n_embd, native_patches_total] for a native_n x native_n grid
+        int n_embd_pos = (int)vs.pos_embd->ne[0];
+        int native_total = (int)vs.pos_embd->ne[1];
+        int native_n = (int)sqrtf((float)native_total);  // 32 for 512px
+        int target_n = (int)sqrtf((float)inp_pos->ne[1]); // e.g., 24 for 384px
+        int target_total = target_n * target_n;
+
+        // Read native pos embeddings from backend
+        std::vector<float> native_pos(n_embd_pos * native_total);
+        ggml_backend_tensor_get(vs.pos_embd, native_pos.data(), 0,
+            native_pos.size() * sizeof(float));
+
+        // Bilinear interpolation: for each target (tx, ty), map to source (sx, sy)
+        std::vector<float> interp_pos(n_embd_pos * target_total);
+        for (int ty = 0; ty < target_n; ty++) {
+            for (int tx = 0; tx < target_n; tx++) {
+                // Map target coords to source coords (center-aligned)
+                float sx = ((float)tx + 0.5f) * native_n / target_n - 0.5f;
+                float sy = ((float)ty + 0.5f) * native_n / target_n - 0.5f;
+                sx = std::max(0.0f, std::min(sx, (float)(native_n - 1)));
+                sy = std::max(0.0f, std::min(sy, (float)(native_n - 1)));
+
+                int x0 = (int)sx, y0 = (int)sy;
+                int x1 = std::min(x0 + 1, native_n - 1);
+                int y1 = std::min(y0 + 1, native_n - 1);
+                float fx = sx - x0, fy = sy - y0;
+
+                // Indices in the flattened [n_embd, n_patches] layout
+                int i00 = y0 * native_n + x0;
+                int i10 = y0 * native_n + x1;
+                int i01 = y1 * native_n + x0;
+                int i11 = y1 * native_n + x1;
+                int dst_idx = ty * target_n + tx;
+
+                for (int e = 0; e < n_embd_pos; e++) {
+                    float v00 = native_pos[e + i00 * n_embd_pos];
+                    float v10 = native_pos[e + i10 * n_embd_pos];
+                    float v01 = native_pos[e + i01 * n_embd_pos];
+                    float v11 = native_pos[e + i11 * n_embd_pos];
+                    interp_pos[e + dst_idx * n_embd_pos] =
+                        (1-fx)*(1-fy)*v00 + fx*(1-fy)*v10 +
+                        (1-fx)*fy*v01 + fx*fy*v11;
+                }
+            }
+        }
+
+        ggml_backend_tensor_set(inp_pos, interp_pos.data(), 0,
+            interp_pos.size() * sizeof(float));
+        LOG_KV("pos_embd interp", "%dx%d -> %dx%d (bilinear)",
+            native_n, native_n, target_n, target_n);
+    }
+
     double input_ms = t.ms();
     LOG_KV("input set time", "%.1f ms", input_ms);
 
-    // Execute vision encoder
+    // Profile vision graph ops
+    {
+        std::map<std::string, int> op_counts;
+        std::map<std::string, int64_t> op_flops;
+        int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; i++) {
+            struct ggml_tensor * node = ggml_graph_node(graph, i);
+            const char * op_name = ggml_op_name(node->op);
+            op_counts[op_name]++;
+            // Estimate FLOPs for matmul
+            if (node->op == GGML_OP_MUL_MAT) {
+                int64_t m = node->ne[1]; // rows of output
+                int64_t n = node->ne[0]; // cols of output
+                int64_t k = node->src[0]->ne[0]; // inner dimension
+                int64_t batch = node->ne[2] * node->ne[3];
+                op_flops[op_name] += 2 * m * n * k * batch;
+            }
+        }
+        fprintf(stderr, "  │ graph ops (%d nodes):\n", n_nodes);
+        for (auto & [op, count] : op_counts) {
+            auto it = op_flops.find(op);
+            if (it != op_flops.end() && it->second > 0) {
+                fprintf(stderr, "  │   %-25s %3d  (%.1f GFLOP)\n",
+                        op.c_str(), count, it->second / 1e9);
+            } else {
+                fprintf(stderr, "  │   %-25s %3d\n", op.c_str(), count);
+            }
+        }
+    }
+
+    // Execute vision encoder (run twice: warmup + measured)
     t.reset();
-    ggml_backend_graph_compute(backend, graph);
-    ggml_backend_synchronize(backend);
+    if (use_sched) {
+        ggml_backend_sched_graph_compute(vision_sched, graph);
+    } else {
+        ggml_backend_graph_compute(compute_backend, graph);
+        ggml_backend_synchronize(compute_backend);
+    }
     double compute_ms = t.ms();
-    LOG_KV("compute time", "%.1f ms", compute_ms);
+
+    // Warm-up run: re-execute to measure with warm caches
+    if (!use_sched) {
+        // Re-set inputs for clean measurement
+        ggml_backend_tensor_set(inp_pixels, pixels.data(), 0,
+            pixels.size() * sizeof(float));
+        if (v_attn_mask) {
+            int mask_size2 = (int)ggml_nelements(v_attn_mask);
+            std::vector<uint16_t> zeros2(mask_size2, 0);
+            ggml_backend_tensor_set(v_attn_mask, zeros2.data(), 0,
+                mask_size2 * sizeof(uint16_t));
+        }
+        t.reset();
+        ggml_backend_graph_compute(compute_backend, graph);
+        ggml_backend_synchronize(compute_backend);
+        double warm_ms = t.ms();
+        LOG_KV("compute time (cold)", "%.1f ms (%s)", compute_ms, backend_name);
+        LOG_KV("compute time (warm)", "%.1f ms (%s)", warm_ms, backend_name);
+        compute_ms = warm_ms; // use warm run for reporting
+    } else {
+        LOG_KV("compute time", "%.1f ms (%s)", compute_ms, backend_name);
+    }
 
     // Extract output
     struct ggml_tensor * vision_embd = ggml_graph_get_tensor(graph, "vision_embd");
     if (!vision_embd) {
         LOG_FAIL("vision_embd output not found");
-        ggml_gallocr_free(galloc);
+
+        if (galloc) ggml_gallocr_free(galloc);
         ggml_free(ctx);
         return false;
     }
@@ -802,11 +1119,12 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
     if (bad > 0) {
         LOG_FAIL("Vision output contains %d bad values!", bad);
     } else {
-        LOG_OK("Vision encode PASS");
+        LOG_OK("Vision encode PASS (%s, %.1f ms)", backend_name, compute_ms);
     }
     LOG_END();
 
-    ggml_gallocr_free(galloc);
+    if (vision_sched) ggml_backend_sched_free(vision_sched);
+    if (galloc) ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return bad == 0;
 }
@@ -814,7 +1132,7 @@ static bool run_vision_encode(VisionModelState & vs, ggml_backend_t backend,
 // ===========================================================================
 // Stage 6: Text-only LLM forward (sanity check)
 // ===========================================================================
-static bool run_text_only_test(ModelState & state, ggml_backend_t backend,
+static bool run_text_only_test(ModelState & state, const Backends & be,
                                bool verbose) {
     LOG_SECTION("STAGE 6: Text-Only LLM Forward (Sanity Check)");
 
@@ -861,19 +1179,17 @@ static bool run_text_only_test(ModelState & state, ggml_backend_t backend,
     struct ggml_cgraph * graph = build_graph(ctx, state, seq_len, kv_pos, kv_len,
         (int)cfg.n_layer, false);
 
-    // Allocate
-    ggml_gallocr_t galloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
-        LOG_FAIL("Graph alloc failed");
-        ggml_gallocr_free(galloc);
+    // Allocate via scheduler (GPU primary if available)
+    ggml_backend_sched_t sched = create_llm_sched(be);
+    if (!ggml_backend_sched_alloc_graph(sched, graph)) {
+        LOG_FAIL("Graph sched alloc failed");
+        ggml_backend_sched_free(sched);
         ggml_free(ctx);
         return false;
     }
 
     LOG_KV("graph nodes", "%d", ggml_graph_n_nodes(graph));
-    LOG_KV("compute buffer", "%.2f MB",
-        ggml_gallocr_get_buffer_size(galloc, 0) / 1024.0 / 1024.0);
+    LOG_KV("compute", "%s", be.gpu ? "GPU primary + CPU fallback" : "CPU only");
 
     // Set inputs
     ggml_backend_tensor_set(ggml_graph_get_tensor(graph, "inp_tokens"),
@@ -891,15 +1207,14 @@ static bool run_text_only_test(ModelState & state, ggml_backend_t backend,
 
     // Compute
     t.reset();
-    ggml_backend_graph_compute(backend, graph);
-    ggml_backend_synchronize(backend);
+    ggml_backend_sched_graph_compute(sched, graph);
     double fwd_ms = t.ms();
 
     // Read logits
     struct ggml_tensor * logits_t = ggml_graph_get_tensor(graph, "logits");
     if (!logits_t) {
         LOG_FAIL("logits tensor not found");
-        ggml_gallocr_free(galloc);
+        ggml_backend_sched_free(sched);
         ggml_free(ctx);
         return false;
     }
@@ -938,7 +1253,7 @@ static bool run_text_only_test(ModelState & state, ggml_backend_t backend,
 
     state.kv_pos = kv_len;
 
-    ggml_gallocr_free(galloc);
+    ggml_backend_sched_free(sched);
     ggml_free(ctx);
     return bad == 0;
 }
@@ -947,7 +1262,7 @@ static bool run_text_only_test(ModelState & state, ggml_backend_t backend,
 // Stage 7: Full VLM pipeline
 // ===========================================================================
 static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
-                             ggml_backend_t backend,
+                             const Backends & be,
                              const std::vector<float> & vision_embeds,
                              int n_vision_tokens, int vision_dim,
                              const VLMTestConfig & test_cfg) {
@@ -1063,29 +1378,14 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
     LOG_SUBSECTION("Embedding Merge");
     t.reset();
 
-    // Get text embeddings from token_embd weight
-    // token_embd: [n_vocab, n_embd] in GGUF
-    // ggml_get_rows does: output[i] = token_embd[tokens[i]]
-    // We do this manually on CPU for the merge step
+    // Get text embeddings using fast CPU mmap lookup (bypasses GPU tensor_get)
     int n_embd = (int)cfg.n_embd;
     std::vector<float> merged_embeds(total_seq * n_embd);
-
-    // Read the full embedding table (we need random access)
-    // For efficiency, only read the rows we need
-    // token_embd type might be quantized — we need to dequantize
-    // For simplicity, read using ggml backend tensor_get row by row
-    size_t row_bytes = ggml_row_size(state.token_embd->type, n_embd);
-    std::vector<uint8_t> row_buf(row_bytes);
     std::vector<float> row_f32(n_embd);
 
     // Fill prefix embeddings
     for (int i = 0; i < n_prefix; i++) {
-        int tok = prefix_tokens[i];
-        ggml_backend_tensor_get(state.token_embd, row_buf.data(),
-            (size_t)tok * row_bytes, row_bytes);
-        // Dequantize to F32
-        ggml_get_type_traits(state.token_embd->type)->to_float(
-            row_buf.data(), row_f32.data(), n_embd);
+        lookup_token_embedding(state, prefix_tokens[i], row_f32.data(), n_embd);
         memcpy(&merged_embeds[i * n_embd], row_f32.data(), n_embd * sizeof(float));
     }
 
@@ -1098,11 +1398,7 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
 
     // Fill suffix embeddings
     for (int i = 0; i < n_suffix; i++) {
-        int tok = suffix_tokens[i];
-        ggml_backend_tensor_get(state.token_embd, row_buf.data(),
-            (size_t)tok * row_bytes, row_bytes);
-        ggml_get_type_traits(state.token_embd->type)->to_float(
-            row_buf.data(), row_f32.data(), n_embd);
+        lookup_token_embedding(state, suffix_tokens[i], row_f32.data(), n_embd);
         memcpy(&merged_embeds[(n_prefix + n_vision_tokens + i) * n_embd],
                row_f32.data(), n_embd * sizeof(float));
     }
@@ -1138,18 +1434,16 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
     struct ggml_cgraph * graph = build_vlm_prefill_graph(ctx, state,
         total_seq, kv_pos, kv_len);
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
-        LOG_FAIL("VLM prefill graph alloc failed");
-        ggml_gallocr_free(galloc);
+    ggml_backend_sched_t prefill_sched = create_llm_sched(be);
+    if (!ggml_backend_sched_alloc_graph(prefill_sched, graph)) {
+        LOG_FAIL("VLM prefill sched alloc failed");
+        ggml_backend_sched_free(prefill_sched);
         ggml_free(ctx);
         return false;
     }
 
     LOG_KV("graph nodes", "%d", ggml_graph_n_nodes(graph));
-    LOG_KV("compute buffer", "%.2f MB",
-        ggml_gallocr_get_buffer_size(galloc, 0) / 1024.0 / 1024.0);
+    LOG_KV("compute", "%s", be.gpu ? "GPU primary + CPU fallback" : "CPU only");
 
     // Set inputs
     ggml_backend_tensor_set(ggml_graph_get_tensor(graph, "inp_embd"),
@@ -1167,8 +1461,7 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
 
     // Compute prefill
     t.reset();
-    ggml_backend_graph_compute(backend, graph);
-    ggml_backend_synchronize(backend);
+    ggml_backend_sched_graph_compute(prefill_sched, graph);
     double prefill_ms = t.ms();
 
     // Extract last token logits
@@ -1198,17 +1491,39 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
 
     state.kv_pos = kv_len;
 
-    ggml_gallocr_free(galloc);
+    ggml_backend_sched_free(prefill_sched);
     ggml_free(ctx);
 
     // --- Autoregressive decode ---
     LOG_SUBSECTION("Autoregressive Decode");
     t.reset();
 
-    // Reserve graph allocator for decode (seq_len=1)
-    ggml_gallocr_t decode_galloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    {
+    // Choose decode mode: direct GPU or CPU scheduler
+    bool use_direct_gpu = test_cfg.use_gpu && be.gpu;
+    ggml_backend_t decode_be = use_direct_gpu ? be.gpu : be.cpu;
+
+    // Allocator for decode graphs
+    ggml_gallocr_t decode_galloc = nullptr;
+    ggml_backend_sched_t decode_sched = nullptr;
+
+    if (use_direct_gpu) {
+        // Direct GPU: use prefill graph (takes embeddings, no get_rows needed)
+        decode_galloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(be.gpu));
+        size_t dctx_size = vlm_prefill_ctx_size((int)cfg.n_layer);
+        struct ggml_init_params dp = { dctx_size, nullptr, true };
+        struct ggml_context * measure_ctx = ggml_init(dp);
+        struct ggml_cgraph * measure_graph = build_vlm_prefill_graph(measure_ctx, state,
+            1, 0, (int)cfg.max_ctx);
+        ggml_gallocr_reserve(decode_galloc, measure_graph);
+        ggml_free(measure_ctx);
+        LOG_KV("decode mode", "DIRECT GPU (embedding input, no scheduler)");
+        LOG_KV("decode compute buf", "%.2f MB",
+            ggml_gallocr_get_buffer_size(decode_galloc, 0) / 1024.0 / 1024.0);
+    } else {
+        // CPU: use direct gallocr (avoids scheduler backend-routing overhead)
+        decode_galloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(be.cpu));
         size_t dctx_size = compute_ctx_size((int)cfg.n_layer);
         struct ggml_init_params dp = { dctx_size, nullptr, true };
         struct ggml_context * measure_ctx = ggml_init(dp);
@@ -1216,18 +1531,24 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
             1, 0, (int)cfg.max_ctx, (int)cfg.n_layer, false);
         ggml_gallocr_reserve(decode_galloc, measure_graph);
         ggml_free(measure_ctx);
+        LOG_KV("decode mode", "CPU direct gallocr (%d threads)", test_cfg.threads);
+        LOG_KV("decode compute buf", "%.2f MB",
+            ggml_gallocr_get_buffer_size(decode_galloc, 0) / 1024.0 / 1024.0);
     }
-    LOG_KV("decode compute buf", "%.2f MB",
-        ggml_gallocr_get_buffer_size(decode_galloc, 0) / 1024.0 / 1024.0);
 
     std::string generated;
     int last_token = first_token;
     std::vector<double> decode_times;
-    size_t decode_ctx_size = compute_ctx_size((int)cfg.n_layer);
+    size_t decode_ctx_size = use_direct_gpu
+        ? vlm_prefill_ctx_size((int)cfg.n_layer)
+        : compute_ctx_size((int)cfg.n_layer);
     std::vector<uint8_t> decode_ctx_buf(decode_ctx_size);
 
     printf("  │   Generating: %s", first_str.c_str());
     fflush(stdout);
+
+    // Timing breakdown accumulators (printed at end)
+    double total_graph_build_ms = 0, total_alloc_ms = 0, total_input_ms = 0, total_compute_ms = 0;
 
     for (int step = 0; step < test_cfg.max_tokens; step++) {
         if (last_token == state.eos_token) break;
@@ -1237,20 +1558,46 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
         kv_pos = state.kv_pos;
         kv_len = kv_pos + 1;
 
+        Timer t_build;
         struct ggml_init_params dp = { decode_ctx_size, decode_ctx_buf.data(), true };
         struct ggml_context * dctx = ggml_init(dp);
-        struct ggml_cgraph * dgraph = build_graph(dctx, state, 1, kv_pos, kv_len,
-            (int)cfg.n_layer, false);
 
-        if (!ggml_gallocr_alloc_graph(decode_galloc, dgraph)) {
-            LOG_FAIL("Decode graph alloc failed at step %d", step);
+        struct ggml_cgraph * dgraph = nullptr;
+        if (use_direct_gpu) {
+            dgraph = build_vlm_prefill_graph(dctx, state, 1, kv_pos, kv_len);
+        } else {
+            dgraph = build_graph(dctx, state, 1, kv_pos, kv_len,
+                (int)cfg.n_layer, false);
+        }
+        total_graph_build_ms += t_build.ms();
+
+        // Allocate
+        Timer t_alloc;
+        bool alloc_ok = false;
+        if (decode_sched) {
+            ggml_backend_sched_reset(decode_sched);
+            alloc_ok = ggml_backend_sched_alloc_graph(decode_sched, dgraph);
+        } else {
+            alloc_ok = ggml_gallocr_alloc_graph(decode_galloc, dgraph);
+        }
+        total_alloc_ms += t_alloc.ms();
+        if (!alloc_ok) {
+            LOG_FAIL("Decode alloc failed at step %d", step);
             ggml_free(dctx);
             break;
         }
 
-        // Set input token
-        ggml_backend_tensor_set(ggml_graph_get_tensor(dgraph, "inp_tokens"),
-            &last_token, 0, sizeof(int32_t));
+        // Set input
+        Timer t_input;
+        if (use_direct_gpu) {
+            std::vector<float> tok_embd(cfg.n_embd);
+            lookup_token_embedding(state, last_token, tok_embd.data(), (int)cfg.n_embd);
+            ggml_backend_tensor_set(ggml_graph_get_tensor(dgraph, "inp_embd"),
+                tok_embd.data(), 0, cfg.n_embd * sizeof(float));
+        } else {
+            ggml_backend_tensor_set(ggml_graph_get_tensor(dgraph, "inp_tokens"),
+                &last_token, 0, sizeof(int32_t));
+        }
 
         int32_t pos = kv_pos;
         ggml_backend_tensor_set(ggml_graph_get_tensor(dgraph, "inp_pos"),
@@ -1260,18 +1607,24 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
         build_causal_mask(dmask, kv_len, 1, kv_pos);
         ggml_backend_tensor_set(ggml_graph_get_tensor(dgraph, "attn_mask"),
             dmask.data(), 0, kv_len * sizeof(uint16_t));
+        total_input_ms += t_input.ms();
 
         Timer dt;
-        ggml_backend_graph_compute(backend, dgraph);
-        ggml_backend_synchronize(backend);
+        if (decode_sched) {
+            ggml_backend_sched_graph_compute(decode_sched, dgraph);
+        } else {
+            ggml_backend_graph_compute(use_direct_gpu ? be.gpu : be.cpu, dgraph);
+            if (use_direct_gpu) ggml_backend_synchronize(be.gpu);
+        }
         double tok_ms = dt.ms();
+        total_compute_ms += tok_ms;
         decode_times.push_back(tok_ms);
 
         // Get logits
         struct ggml_tensor * dl = ggml_graph_get_tensor(dgraph, "logits");
         ggml_backend_tensor_get(dl, logits.data(), 0, cfg.n_vocab * sizeof(float));
 
-        // Apply repetition penalty (penalize tokens that appeared in recent context)
+        // Apply repetition penalty
         if (sp.rep_penalty != 1.0f) {
             for (int32_t prev_tok : generated_tokens) {
                 if (prev_tok >= 0 && prev_tok < (int)cfg.n_vocab) {
@@ -1316,11 +1669,15 @@ static bool run_vlm_pipeline(ModelState & state, VisionModelState & vs,
         LOG_KV("avg ms/token", "%.1f ms", avg);
         LOG_KV("min/max ms/token", "%.1f / %.1f ms", min_t, max_t);
         LOG_KV("throughput", "%.1f tok/s", decode_times.size() / (total_decode_ms / 1000.0));
+        int n = (int)decode_times.size();
+        LOG_KV("overhead breakdown", "graph_build=%.1f alloc=%.1f input=%.1f compute=%.1f ms/tok",
+            total_graph_build_ms / n, total_alloc_ms / n, total_input_ms / n, total_compute_ms / n);
     }
     LOG_OK("VLM decode PASS");
     LOG_END();
 
-    ggml_gallocr_free(decode_galloc);
+    if (decode_galloc) ggml_gallocr_free(decode_galloc);
+    if (decode_sched) ggml_backend_sched_free(decode_sched);
     return true;
 }
 
@@ -1356,6 +1713,9 @@ static void print_summary(ModelState & state, VisionModelState & vs,
 // main
 // ===========================================================================
 int main(int argc, char ** argv) {
+    // Set OMP affinity to big cores BEFORE any OpenMP initialization
+    setup_omp_big_core_affinity();
+
     printf("\n");
     printf("  ╦  ╦╦  ╔╦╗  ╔═╗┬┌─┐┌─┐┬  ┬┌┐┌┌─┐  ╔╦╗┌─┐┌─┐┌┬┐\n");
     printf("  ╚╗╔╝║  ║║║  ╠═╝│├─┘├┤ │  ││││├┤    ║ ├┤ └─┐ │ \n");
@@ -1368,19 +1728,23 @@ int main(int argc, char ** argv) {
     Timer total;
 
     // Stage 1: Backend
-    ggml_backend_t backend = init_backend(test_cfg.threads);
-    if (!backend) return 1;
+    Backends be = init_backends(test_cfg.threads);
+    if (!be.cpu) return 1;
 
-    // Stage 2: LLM
+    // Stage 2: LLM — load weights on GPU or CPU
+    ggml_backend_t llm_backend = (test_cfg.use_gpu && be.gpu) ? be.gpu : be.cpu;
+    printf("\n  [CONFIG] LLM backend: %s\n", ggml_backend_name(llm_backend));
     ModelState state = {};
-    if (!load_llm(state, test_cfg.model_path, backend, test_cfg.verbose)) return 1;
+    if (!load_llm(state, test_cfg.model_path, llm_backend, test_cfg.verbose,
+                  test_cfg.quant, test_cfg.quant_ffn)) return 1;
 
-    // Stage 3: Vision
+    // Stage 3: Vision — CPU (I8MM is faster than GPU for this model)
+    ggml_backend_t vision_backend = be.cpu;
     VisionModelState vs = {};
-    if (!load_vision(vs, test_cfg.mmproj_path, backend, test_cfg.verbose)) return 1;
+    if (!load_vision(vs, test_cfg.mmproj_path, vision_backend, test_cfg.verbose)) return 1;
 
-    // Stage 4: KV cache
-    if (!setup_kv_cache(state, backend)) return 1;
+    // Stage 4: KV cache on same backend as LLM weights (GPU if available)
+    if (!setup_kv_cache(state, llm_backend)) return 1;
 
     // Dump chat template from GGUF if available
     {
@@ -1393,19 +1757,20 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Stage 5: Vision encode
+    // Stage 5: Vision encode (GPU if available)
     std::vector<float> vision_embeds;
     int n_vision_tokens = 0, vision_dim = 0;
-    bool vision_ok = run_vision_encode(vs, backend, vision_embeds,
-        n_vision_tokens, vision_dim, test_cfg.image_path, test_cfg.verbose);
+    bool vision_ok = run_vision_encode(vs, be, vision_embeds,
+        n_vision_tokens, vision_dim, test_cfg.image_path, test_cfg.verbose,
+        test_cfg.vlayers, test_cfg.image_size);
 
-    // Stage 6: Text-only sanity check
-    bool text_ok = run_text_only_test(state, backend, test_cfg.verbose);
+    // Stage 6: Text-only sanity check (GPU if available)
+    bool text_ok = run_text_only_test(state, be, test_cfg.verbose);
 
-    // Stage 7: Full VLM pipeline (only if both vision and text work)
+    // Stage 7: Full VLM pipeline (GPU-accelerated LLM)
     bool vlm_ok = false;
     if (vision_ok && text_ok) {
-        vlm_ok = run_vlm_pipeline(state, vs, backend,
+        vlm_ok = run_vlm_pipeline(state, vs, be,
             vision_embeds, n_vision_tokens, vision_dim, test_cfg);
     } else {
         printf("\n  SKIPPING Stage 7: Vision=%s Text=%s\n",
@@ -1423,7 +1788,8 @@ int main(int argc, char ** argv) {
     if (state.weight_ctx) ggml_free(state.weight_ctx);
     if (state.data_ctx) ggml_free(state.data_ctx);
     if (state.gguf_ctx) gguf_free(state.gguf_ctx);
-    ggml_backend_free(backend);
+    if (be.gpu) ggml_backend_free(be.gpu);
+    ggml_backend_free(be.cpu);
 
     return vlm_ok ? 0 : 1;
 }

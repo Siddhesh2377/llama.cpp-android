@@ -47,6 +47,9 @@ struct VLayerW {
     ggml_tensor * ln_2_w, * ln_2_b;
     ggml_tensor * ffn_up_w, * ffn_up_b;
     ggml_tensor * ffn_down_w, * ffn_down_b;
+    // Fused QKV (when non-null, graph uses fused matmul + views)
+    ggml_tensor * attn_qkv_w = nullptr;  // [n_embd, 3*n_embd]
+    ggml_tensor * attn_qkv_b = nullptr;  // [3*n_embd]
 };
 
 struct VState {
@@ -74,7 +77,7 @@ static VState g_vs = {};
 // ---------------------------------------------------------------------------
 // load_vision_model
 // ---------------------------------------------------------------------------
-bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t backend) {
+bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t backend, bool quantize) {
     printf("\n=== Loading Vision Model ===\n");
     auto t0 = Clock::now();
 
@@ -130,23 +133,32 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
         }
     }
 
-    // Count tensors: 6 global + 16 per layer
-    int n_tensors = 6 + (int)vc.n_layer * 16;
+    // Count tensors: 6 global + 12 per layer (fused QKV saves 4)
+    int n_tensors = 6 + (int)vc.n_layer * 12;
     size_t ctx_size = (size_t)n_tensors * ggml_tensor_overhead() + 256;
     ggml_init_params wparams = { ctx_size, nullptr, true };
     g_vs.weight_ctx = ggml_init(wparams);
 
-    auto mw = [&](const char * name, bool transpose = false) -> ggml_tensor * {
+    // Target type for 2D matmul weights (Q8_0 enables I8MM for vision GEMM)
+    ggml_type vision_wtype = quantize ? GGML_TYPE_Q8_0 : GGML_TYPE_COUNT;
+
+    auto mw = [&](const char * name, bool transpose = false, bool is_matmul = true) -> ggml_tensor * {
         ggml_tensor * src = ggml_get_tensor(data_ctx, name);
         if (!src) return nullptr;
         ggml_tensor * dst = nullptr;
         int nd = ggml_n_dims(src);
+        ggml_type tgt = src->type;
+        // Quantize 2D matmul weights (F16/F32 → Q8_0) for I8MM GEMM
+        if (is_matmul && nd == 2 && vision_wtype != GGML_TYPE_COUNT &&
+            (src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_F32)) {
+            tgt = vision_wtype;
+        }
         if (nd == 1)      dst = ggml_new_tensor_1d(g_vs.weight_ctx, src->type, src->ne[0]);
         else if (nd == 2) {
             if (transpose)
-                dst = ggml_new_tensor_2d(g_vs.weight_ctx, src->type, src->ne[1], src->ne[0]);
+                dst = ggml_new_tensor_2d(g_vs.weight_ctx, tgt, src->ne[1], src->ne[0]);
             else
-                dst = ggml_new_tensor_2d(g_vs.weight_ctx, src->type, src->ne[0], src->ne[1]);
+                dst = ggml_new_tensor_2d(g_vs.weight_ctx, tgt, src->ne[0], src->ne[1]);
         }
         else if (nd == 3) dst = ggml_new_tensor_3d(g_vs.weight_ctx, src->type, src->ne[0], src->ne[1], src->ne[2]);
         else              dst = ggml_new_tensor_4d(g_vs.weight_ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
@@ -157,7 +169,7 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
     // Global tensors
     g_vs.patch_embd_w = mw("v.patch_embd.weight");
     g_vs.patch_embd_b = mw("v.patch_embd.bias");
-    g_vs.pos_embd     = mw("v.position_embd.weight");
+    g_vs.pos_embd     = mw("v.position_embd.weight", false, false);  // embedding, not matmul
     g_vs.post_ln_w    = mw("v.post_ln.weight");
     g_vs.post_ln_b    = mw("v.post_ln.bias");
     g_vs.proj_w       = mw("mm.model.fc.weight");
@@ -173,12 +185,32 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
         VLayerW & lw = g_vs.layers[il];
         snprintf(buf, sizeof(buf), "v.blk.%u.ln1.weight", il);   lw.ln_1_w = mw(buf);
         snprintf(buf, sizeof(buf), "v.blk.%u.ln1.bias", il);     lw.ln_1_b = mw(buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.weight", il);  lw.attn_q_w = mw(buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.bias", il);    lw.attn_q_b = mw(buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_k.weight", il);  lw.attn_k_w = mw(buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_k.bias", il);    lw.attn_k_b = mw(buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_v.weight", il);  lw.attn_v_w = mw(buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_v.bias", il);    lw.attn_v_b = mw(buf);
+
+        // Fused QKV weight: determine type from source Q weight
+        {
+            snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.weight", il);
+            ggml_tensor * src_q = ggml_get_tensor(data_ctx, buf);
+            ggml_type qkv_type = src_q ? src_q->type : GGML_TYPE_F16;
+            if (vision_wtype != GGML_TYPE_COUNT &&
+                (qkv_type == GGML_TYPE_F16 || qkv_type == GGML_TYPE_F32)) {
+                qkv_type = vision_wtype;
+            }
+            lw.attn_qkv_w = ggml_new_tensor_2d(g_vs.weight_ctx, qkv_type,
+                vc.n_embd, 3 * vc.n_embd);
+            snprintf(buf, sizeof(buf), "v.blk.%u.qkv.weight", il);
+            ggml_set_name(lw.attn_qkv_w, buf);
+
+            // Fused QKV bias
+            snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.bias", il);
+            ggml_tensor * src_qb = ggml_get_tensor(data_ctx, buf);
+            if (src_qb) {
+                lw.attn_qkv_b = ggml_new_tensor_1d(g_vs.weight_ctx,
+                    src_qb->type, 3 * vc.n_embd);
+                snprintf(buf, sizeof(buf), "v.blk.%u.qkv.bias", il);
+                ggml_set_name(lw.attn_qkv_b, buf);
+            }
+        }
+
         snprintf(buf, sizeof(buf), "v.blk.%u.attn_out.weight", il); lw.attn_out_w = mw(buf);
         snprintf(buf, sizeof(buf), "v.blk.%u.attn_out.bias", il);   lw.attn_out_b = mw(buf);
         snprintf(buf, sizeof(buf), "v.blk.%u.ln2.weight", il);   lw.ln_2_w = mw(buf);
@@ -198,17 +230,35 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
     auto cw = [&](ggml_tensor * dst, const char * name, bool transpose = false) {
         ggml_tensor * src = ggml_get_tensor(data_ctx, name);
         if (!src || !dst) return;
-        if (transpose && ggml_n_dims(src) == 2 && src->type == GGML_TYPE_F16) {
-            // Transpose F16 2D weight: [ne0, ne1] -> [ne1, ne0]
-            int64_t ne0 = src->ne[0], ne1 = src->ne[1];
-            std::vector<uint16_t> transposed(ne0 * ne1);
-            const uint16_t * s = (const uint16_t *)src->data;
-            for (int64_t j = 0; j < ne1; j++)
-                for (int64_t i = 0; i < ne0; i++)
-                    transposed[j + i * ne1] = s[i + j * ne0];
-            ggml_backend_tensor_set(dst, transposed.data(), 0, ne0 * ne1 * sizeof(uint16_t));
-        } else {
+        bool need_requant = (dst->type != src->type);
+        if (!transpose && !need_requant) {
+            // Fast path: direct copy
             ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+            return;
+        }
+        // General path: dequantize → optional transpose → quantize/copy
+        int64_t src_ne0 = src->ne[0], src_ne1 = std::max((int64_t)1, src->ne[1]);
+        int64_t nels = src_ne0 * src_ne1;
+        std::vector<float> f32(nels);
+        ggml_get_type_traits(src->type)->to_float(src->data, f32.data(), nels);
+
+        float * out = f32.data();
+        std::vector<float> f32_t;
+        if (transpose && ggml_n_dims(src) == 2) {
+            f32_t.resize(nels);
+            for (int64_t j = 0; j < src_ne1; j++)
+                for (int64_t i = 0; i < src_ne0; i++)
+                    f32_t[j + i * src_ne1] = f32[i + j * src_ne0];
+            out = f32_t.data();
+        }
+
+        if (dst->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(dst, out, 0, ggml_nbytes(dst));
+        } else {
+            std::vector<uint8_t> dst_buf(ggml_nbytes(dst));
+            ggml_get_type_traits_cpu(dst->type)->from_float(
+                out, dst_buf.data(), ggml_nelements(dst));
+            ggml_backend_tensor_set(dst, dst_buf.data(), 0, ggml_nbytes(dst));
         }
     };
 
@@ -223,12 +273,61 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
         VLayerW & lw = g_vs.layers[il];
         snprintf(buf, sizeof(buf), "v.blk.%u.ln1.weight", il);   cw(lw.ln_1_w, buf);
         snprintf(buf, sizeof(buf), "v.blk.%u.ln1.bias", il);     cw(lw.ln_1_b, buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.weight", il);  cw(lw.attn_q_w, buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.bias", il);    cw(lw.attn_q_b, buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_k.weight", il);  cw(lw.attn_k_w, buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_k.bias", il);    cw(lw.attn_k_b, buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_v.weight", il);  cw(lw.attn_v_w, buf);
-        snprintf(buf, sizeof(buf), "v.blk.%u.attn_v.bias", il);    cw(lw.attn_v_b, buf);
+
+        // Copy fused QKV: assemble Q|K|V into CPU buffer, then single set_tensor
+        // (OpenCL Q8_0 SOA handler replaces tensor->extra on set, so partial
+        //  writes would corrupt the extra on subsequent calls)
+        if (lw.attn_qkv_w) {
+            ggml_type dst_type = lw.attn_qkv_w->type;
+            int64_t ne0 = (int64_t)vc.n_embd;
+            size_t row_bytes_dst = ggml_row_size(dst_type, ne0);
+            size_t total_bytes = ggml_nbytes(lw.attn_qkv_w);
+            std::vector<uint8_t> qkv_buf(total_bytes, 0);
+
+            auto copy_rows = [&](const char * src_name, size_t dst_off) -> size_t {
+                ggml_tensor * src = ggml_get_tensor(data_ctx, src_name);
+                if (!src) return 0;
+                int64_t nrows = src->ne[1];
+                if (dst_type == src->type) {
+                    memcpy(qkv_buf.data() + dst_off, src->data, ggml_nbytes(src));
+                } else {
+                    size_t row_bytes_src = ggml_row_size(src->type, ne0);
+                    std::vector<float> f32(ne0);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        ggml_get_type_traits(src->type)->to_float(
+                            (const uint8_t*)src->data + r * row_bytes_src, f32.data(), ne0);
+                        ggml_get_type_traits_cpu(dst_type)->from_float(
+                            f32.data(), qkv_buf.data() + dst_off + r * row_bytes_dst, ne0);
+                    }
+                }
+                return (size_t)(nrows * row_bytes_dst);
+            };
+
+            size_t off = 0;
+            snprintf(buf, sizeof(buf), "v.blk.%u.attn_q.weight", il);
+            off += copy_rows(buf, off);
+            snprintf(buf, sizeof(buf), "v.blk.%u.attn_k.weight", il);
+            off += copy_rows(buf, off);
+            snprintf(buf, sizeof(buf), "v.blk.%u.attn_v.weight", il);
+            copy_rows(buf, off);
+
+            // Single set_tensor call with full assembled QKV data
+            ggml_backend_tensor_set(lw.attn_qkv_w, qkv_buf.data(), 0, total_bytes);
+
+            // Copy fused bias (concatenate Q/K/V biases)
+            if (lw.attn_qkv_b) {
+                size_t bias_off = 0;
+                for (const char * suffix : {"attn_q", "attn_k", "attn_v"}) {
+                    snprintf(buf, sizeof(buf), "v.blk.%u.%s.bias", il, suffix);
+                    ggml_tensor * b = ggml_get_tensor(data_ctx, buf);
+                    if (b) {
+                        ggml_backend_tensor_set(lw.attn_qkv_b, b->data, bias_off, ggml_nbytes(b));
+                        bias_off += ggml_nbytes(b);
+                    }
+                }
+            }
+        }
+
         snprintf(buf, sizeof(buf), "v.blk.%u.attn_out.weight", il); cw(lw.attn_out_w, buf);
         snprintf(buf, sizeof(buf), "v.blk.%u.attn_out.bias", il);   cw(lw.attn_out_b, buf);
         snprintf(buf, sizeof(buf), "v.blk.%u.ln2.weight", il);   cw(lw.ln_2_w, buf);
@@ -245,6 +344,12 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
     auto t1 = Clock::now();
     printf("  Weight buffer: %.1f MB\n",
         ggml_backend_buffer_get_size(g_vs.weight_buf) / 1024.0 / 1024.0);
+    printf("  Weight types: qkv=%s out=%s ffn=%s proj=%s%s\n",
+        g_vs.layers[0].attn_qkv_w ? ggml_type_name(g_vs.layers[0].attn_qkv_w->type) : "?",
+        g_vs.layers[0].attn_out_w ? ggml_type_name(g_vs.layers[0].attn_out_w->type) : "?",
+        g_vs.layers[0].ffn_up_w ? ggml_type_name(g_vs.layers[0].ffn_up_w->type) : "?",
+        g_vs.proj_w ? ggml_type_name(g_vs.proj_w->type) : "?",
+        quantize ? " (quantized F16→Q8_0)" : "");
     printf("  Loaded in %.0f ms\n",
         std::chrono::duration<double, std::milli>(t1 - t0).count());
     g_vs.loaded = true;
@@ -252,6 +357,7 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
     // Mirror into the public struct
     vs.weight_ctx = g_vs.weight_ctx;
     vs.weight_buf = g_vs.weight_buf;
+    vs.pos_embd = g_vs.pos_embd;
     vs.loaded = true;
     return true;
 }
@@ -261,7 +367,7 @@ bool load_vision_model(VisionModelState & vs, const char * path, ggml_backend_t 
 // ---------------------------------------------------------------------------
 // Input: [image_size, image_size, 3, 1] F32 normalized pixels
 // Output: [proj_dim, n_patches_out] F32 embeddings ready for LLM
-struct ggml_cgraph * build_vision_graph(ggml_context * ctx, VisionModelState & vs) {
+struct ggml_cgraph * build_vision_graph(ggml_context * ctx, VisionModelState & vs, int n_layers_override) {
     (void)vs;  // we use the internal g_vs
     const VCfg & vc = g_vs.vcfg;
     // conv2d output: floor((image_size - patch_size) / patch_size) + 1
@@ -301,9 +407,17 @@ struct ggml_cgraph * build_vision_graph(ggml_context * ctx, VisionModelState & v
         cur = ggml_add(ctx, cur, g_vs.patch_embd_b);
     }
 
-    // Add position embeddings
+    // Add position embeddings (handle variable resolution)
     if (g_vs.pos_embd) {
-        cur = ggml_add(ctx, cur, g_vs.pos_embd);
+        ggml_tensor * pos = g_vs.pos_embd;
+        if (n_patches_total < (int)pos->ne[1]) {
+            // Variable resolution: create an input tensor for interpolated positions
+            // Caller fills "inp_pos_embd" with bilinear-interpolated pos embeddings
+            pos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_patches_total);
+            ggml_set_name(pos, "inp_pos_embd");
+            ggml_set_input(pos);
+        }
+        cur = ggml_add(ctx, cur, pos);
     }
 
     // Dense attention mask (all zeros = attend everywhere)
@@ -313,7 +427,9 @@ struct ggml_cgraph * build_vision_graph(ggml_context * ctx, VisionModelState & v
     ggml_set_input(attn_mask);
 
     // Transformer blocks
-    for (uint32_t il = 0; il < vc.n_layer; il++) {
+    uint32_t n_vis_layers = (n_layers_override >= 0) ? (uint32_t)n_layers_override : vc.n_layer;
+    if (n_vis_layers > vc.n_layer) n_vis_layers = vc.n_layer;
+    for (uint32_t il = 0; il < n_vis_layers; il++) {
         const VLayerW & lw = g_vs.layers[il];
         ggml_tensor * residual = cur;
 
@@ -322,23 +438,41 @@ struct ggml_cgraph * build_vision_graph(ggml_context * ctx, VisionModelState & v
         cur = ggml_mul(ctx, cur, lw.ln_1_w);
         if (lw.ln_1_b) cur = ggml_add(ctx, cur, lw.ln_1_b);
 
-        // Q, K, V projections (separate, not fused)
-        ggml_tensor * Q = ggml_mul_mat(ctx, lw.attn_q_w, cur);
-        if (lw.attn_q_b) Q = ggml_add(ctx, Q, lw.attn_q_b);
-        ggml_tensor * K = ggml_mul_mat(ctx, lw.attn_k_w, cur);
-        if (lw.attn_k_b) K = ggml_add(ctx, K, lw.attn_k_b);
-        ggml_tensor * V = ggml_mul_mat(ctx, lw.attn_v_w, cur);
-        if (lw.attn_v_b) V = ggml_add(ctx, V, lw.attn_v_b);
-
-        // Reshape to multi-head: [head_dim, n_head, seq]
-        Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, n_patches_total);
-        K = ggml_reshape_3d(ctx, K, head_dim, n_head, n_patches_total);
-        V = ggml_reshape_3d(ctx, V, head_dim, n_head, n_patches_total);
+        // QKV projections — fused or individual
+        ggml_tensor * Q, * K, * V;
+        if (lw.attn_qkv_w) {
+            // Fused: single matmul → reshape → split with views
+            ggml_tensor * qkv = ggml_mul_mat(ctx, lw.attn_qkv_w, cur);
+            if (lw.attn_qkv_b) qkv = ggml_add(ctx, qkv, lw.attn_qkv_b);
+            // [3*n_embd, seq] → [head_dim, 3*n_head, seq]
+            qkv = ggml_reshape_3d(ctx, qkv, head_dim, n_head * 3, n_patches_total);
+            Q = ggml_view_3d(ctx, qkv, head_dim, n_head, n_patches_total,
+                qkv->nb[1], qkv->nb[2], 0);
+            K = ggml_view_3d(ctx, qkv, head_dim, n_head, n_patches_total,
+                qkv->nb[1], qkv->nb[2], (size_t)n_head * qkv->nb[1]);
+            V = ggml_view_3d(ctx, qkv, head_dim, n_head, n_patches_total,
+                qkv->nb[1], qkv->nb[2], (size_t)(2 * n_head) * qkv->nb[1]);
+        } else {
+            Q = ggml_mul_mat(ctx, lw.attn_q_w, cur);
+            if (lw.attn_q_b) Q = ggml_add(ctx, Q, lw.attn_q_b);
+            K = ggml_mul_mat(ctx, lw.attn_k_w, cur);
+            if (lw.attn_k_b) K = ggml_add(ctx, K, lw.attn_k_b);
+            V = ggml_mul_mat(ctx, lw.attn_v_w, cur);
+            if (lw.attn_v_b) V = ggml_add(ctx, V, lw.attn_v_b);
+            Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, n_patches_total);
+            K = ggml_reshape_3d(ctx, K, head_dim, n_head, n_patches_total);
+            V = ggml_reshape_3d(ctx, V, head_dim, n_head, n_patches_total);
+        }
 
         // Permute to [head_dim, seq, n_head] for flash_attn_ext
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
         K = ggml_permute(ctx, K, 0, 2, 1, 3);
         V = ggml_permute(ctx, V, 0, 2, 1, 3);
+
+        // Cast K/V to F16 for optimized flash_attn_ext path
+        // (matmul output is F32, but FA is fastest with F16 K/V — matches LLM KV cache)
+        K = ggml_cast(ctx, K, GGML_TYPE_F16);
+        V = ggml_cast(ctx, V, GGML_TYPE_F16);
 
         // Dense attention (all-zeros mask -> no masking)
         ggml_tensor * attn_out = ggml_flash_attn_ext(ctx,
@@ -420,6 +554,12 @@ struct ggml_cgraph * build_vision_graph(ggml_context * ctx, VisionModelState & v
 }
 
 // ---------------------------------------------------------------------------
+// set_vision_image_size — override for variable resolution
+// ---------------------------------------------------------------------------
+void set_vision_image_size(uint32_t image_size) {
+    g_vs.vcfg.image_size = image_size;
+}
+
 // free_vision_model
 // ---------------------------------------------------------------------------
 void free_vision_model(VisionModelState & vs) {

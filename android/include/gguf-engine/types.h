@@ -80,6 +80,11 @@ struct LayerWeights {
     struct ggml_tensor * ffn_gate;
     struct ggml_tensor * ffn_up;
     struct ggml_tensor * ffn_down;
+
+    // Fused weights (QKV = Q|K|V rows, gate_up = gate|up rows)
+    // When non-null, graph uses fused matmul + views instead of individual matmuls
+    struct ggml_tensor * attn_qkv    = nullptr;  // [n_embd, q_out + k_out + v_out]
+    struct ggml_tensor * ffn_gate_up = nullptr;  // [n_embd, 2 * n_ff]
 };
 
 // ---------------------------------------------------------------------------

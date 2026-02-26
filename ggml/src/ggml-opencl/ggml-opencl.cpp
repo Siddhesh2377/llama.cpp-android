@@ -4325,12 +4325,22 @@ static bool ggml_backend_opencl_buffer_type_supports_backend(ggml_backend_buffer
     UNUSED(buft);
 }
 
+// Q8_0 SOA format needs extra space for alignment padding between scales and quants subbuffers
+static size_t ggml_backend_opencl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    if (tensor->type == GGML_TYPE_Q8_0) {
+        size_t alignment = ggml_backend_buft_get_alignment(buft);
+        size_t base = ggml_nbytes(tensor);
+        return base + alignment;
+    }
+    return ggml_nbytes(tensor);
+}
+
 static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_opencl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_opencl_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_opencl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_opencl_buffer_type_get_max_size,
-    /* .get_alloc_size   = */ NULL,
+    /* .get_alloc_size   = */ ggml_backend_opencl_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
 };
 
