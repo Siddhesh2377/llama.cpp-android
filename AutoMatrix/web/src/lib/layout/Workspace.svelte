@@ -23,6 +23,7 @@
 	import NodeCanvas from '$lib/engine/NodeCanvas.svelte';
 
 	import { documents, activeDocId, openDocument } from '$lib/engine/store';
+	import { setupShortcuts } from '$lib/engine/shortcuts';
 	import { modelToBpDocument } from '$lib/engine/model-to-graph';
 	import { devices } from '$lib/stores/device';
 	import { startPolling, stopPolling, getPlugins, getModelInfo, getModelGraph } from '$lib/api/client';
@@ -34,6 +35,7 @@
 	import { browser } from '$app/environment';
 
 	let unsubModel: (() => void) | null = null;
+	let cleanupShortcuts: (() => void) | null = null;
 
 	async function openModelGraph() {
 		const info = await getModelInfo();
@@ -58,6 +60,13 @@
 		consoleStore.info('Connecting to backend...', 'system');
 		startPolling();
 
+		cleanupShortcuts = setupShortcuts({
+			onRun: () => consoleStore.info('Run triggered (F5)', 'shortcut'),
+			onStop: () => consoleStore.info('Stop triggered (Shift+F5)', 'shortcut'),
+			onFitView: () => consoleStore.info('Fit view triggered (F)', 'shortcut'),
+			onSearch: () => consoleStore.info('Search triggered (Ctrl+F)', 'shortcut'),
+		});
+
 		getPlugins().then(p => {
 			if (p.length > 0) {
 				plugins.set(p);
@@ -79,6 +88,7 @@
 	onDestroy(() => {
 		stopPolling();
 		if (unsubModel) unsubModel();
+		if (cleanupShortcuts) cleanupShortcuts();
 	});
 
 	// Action stubs
