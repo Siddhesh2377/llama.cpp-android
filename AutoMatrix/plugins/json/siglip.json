@@ -1,0 +1,63 @@
+{
+  "id": "siglip",
+  "name": "SigLIP Vision",
+  "version": "1.0",
+  "description": "Google SigLIP-SO vision encoder. 768 embd, 12 layers, 512px, patch=16, GELU activation.",
+  "tensor_patterns": {
+    "patch_embed": "v.patch_embd.weight",
+    "pos_embed": "v.position_embd.weight",
+    "attn_q": "v.blk.{L}.attn_q.weight",
+    "attn_k": "v.blk.{L}.attn_k.weight",
+    "attn_v": "v.blk.{L}.attn_v.weight",
+    "attn_output": "v.blk.{L}.attn_output.weight",
+    "attn_q_bias": "v.blk.{L}.attn_q.bias",
+    "attn_k_bias": "v.blk.{L}.attn_k.bias",
+    "attn_v_bias": "v.blk.{L}.attn_v.bias",
+    "attn_out_bias": "v.blk.{L}.attn_output.bias",
+    "ln1": "v.blk.{L}.ln1.weight",
+    "ln1_bias": "v.blk.{L}.ln1.bias",
+    "ln2": "v.blk.{L}.ln2.weight",
+    "ln2_bias": "v.blk.{L}.ln2.bias",
+    "ffn_up": "v.blk.{L}.ffn_up.weight",
+    "ffn_up_bias": "v.blk.{L}.ffn_up.bias",
+    "ffn_down": "v.blk.{L}.ffn_down.weight",
+    "ffn_down_bias": "v.blk.{L}.ffn_down.bias",
+    "post_ln": "v.post_ln.weight",
+    "post_ln_bias": "v.post_ln.bias"
+  },
+  "fusions": {},
+  "config_keys": {
+    "image_size": "u32",
+    "patch_size": "u32",
+    "embedding_length": "u32",
+    "block_count": "u32",
+    "head_count": "u32",
+    "feed_forward_length": "u32"
+  },
+  "attention": {"type": "full", "rope": false, "bias": true},
+  "activation": "gelu",
+  "norm_type": "layernorm",
+  "graph_template": {
+    "pre": [
+      {"op": "patch_embed", "weight": "patch_embed", "label": "Patch Embedding"},
+      {"op": "add", "weight": "pos_embed", "label": "Position Embedding"}
+    ],
+    "per_layer": [
+      {"op": "layernorm", "weight": "ln1", "bias": "ln1_bias"},
+      {"op": "matmul", "weight": "attn_q", "bias": "attn_q_bias", "label": "Q"},
+      {"op": "matmul", "weight": "attn_k", "bias": "attn_k_bias", "label": "K"},
+      {"op": "matmul", "weight": "attn_v", "bias": "attn_v_bias", "label": "V"},
+      {"op": "attention", "type": "full", "label": "Self-Attention"},
+      {"op": "matmul", "weight": "attn_output", "bias": "attn_out_bias", "label": "Proj"},
+      {"op": "add", "label": "Residual"},
+      {"op": "layernorm", "weight": "ln2", "bias": "ln2_bias"},
+      {"op": "matmul", "weight": "ffn_up", "bias": "ffn_up_bias", "label": "Up"},
+      {"op": "gelu", "label": "GELU"},
+      {"op": "matmul", "weight": "ffn_down", "bias": "ffn_down_bias", "label": "Down"},
+      {"op": "add", "label": "Residual"}
+    ],
+    "post": [
+      {"op": "layernorm", "weight": "post_ln", "bias": "post_ln_bias", "label": "Post LayerNorm"}
+    ]
+  }
+}

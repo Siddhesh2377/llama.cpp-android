@@ -1,0 +1,15 @@
+{
+  "id": "q4_1",
+  "name": "Q4_1",
+  "version": "1.0",
+  "bits_per_weight": 4.5,
+  "block_size": 32,
+  "has_i8mm": true,
+  "quality_rating": 0.15,
+  "speed_rating": 0.98,
+  "description": "4.5-bit with min/max. BROKEN at 360M scale — produces garbage output despite correct vec_dot.",
+  "broken_at_small_scale": true,
+  "benchmarks": {
+    "smolvlm_500m": {"decode_tok_s": 50.6, "weight_mb": 244.1, "bandwidth_gb_s": 13.6}
+  }
+}

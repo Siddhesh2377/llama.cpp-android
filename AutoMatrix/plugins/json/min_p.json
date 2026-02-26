@@ -1,0 +1,11 @@
+{
+  "id": "min_p",
+  "name": "Min-P",
+  "version": "1.0",
+  "description": "Keep tokens with probability >= P * max_prob. Scales naturally with model confidence.",
+  "parameters": {
+    "p": {"type": "f32", "default": 0.05, "min": 0.0, "max": 1.0},
+    "temperature": {"type": "f32", "default": 0.8, "min": 0.0, "max": 2.0}
+  },
+  "algorithm": "min_p_sample"
+}

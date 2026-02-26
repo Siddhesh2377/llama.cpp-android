@@ -1,0 +1,11 @@
+{
+  "id": "top_k",
+  "name": "Top-K",
+  "version": "1.0",
+  "description": "Sample from the K most likely tokens. Higher K = more diverse, lower K = more focused.",
+  "parameters": {
+    "k": {"type": "u32", "default": 40, "min": 1, "max": 1000},
+    "temperature": {"type": "f32", "default": 0.8, "min": 0.0, "max": 2.0}
+  },
+  "algorithm": "top_k_sample"
+}

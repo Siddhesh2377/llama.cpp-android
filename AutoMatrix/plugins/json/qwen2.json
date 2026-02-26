@@ -1,0 +1,60 @@
+{
+  "id": "qwen2",
+  "name": "Qwen2",
+  "version": "1.0",
+  "description": "Alibaba Qwen2 architecture. Similar to LLaMA with bias in QKV and SwiGLU FFN.",
+  "tensor_patterns": {
+    "embed": "token_embd.weight",
+    "attn_q": "blk.{L}.attn_q.weight",
+    "attn_k": "blk.{L}.attn_k.weight",
+    "attn_v": "blk.{L}.attn_v.weight",
+    "attn_q_bias": "blk.{L}.attn_q.bias",
+    "attn_k_bias": "blk.{L}.attn_k.bias",
+    "attn_v_bias": "blk.{L}.attn_v.bias",
+    "attn_output": "blk.{L}.attn_output.weight",
+    "attn_norm": "blk.{L}.attn_norm.weight",
+    "ffn_gate": "blk.{L}.ffn_gate.weight",
+    "ffn_up": "blk.{L}.ffn_up.weight",
+    "ffn_down": "blk.{L}.ffn_down.weight",
+    "ffn_norm": "blk.{L}.ffn_norm.weight",
+    "output_norm": "output_norm.weight",
+    "output": "output.weight"
+  },
+  "fusions": {},
+  "config_keys": {
+    "embedding_length": "u32",
+    "block_count": "u32",
+    "attention.head_count": "u32",
+    "attention.head_count_kv": "u32",
+    "context_length": "u32",
+    "feed_forward_length": "u32"
+  },
+  "attention": {"type": "grouped_query", "rope": true, "bias": true},
+  "activation": "silu",
+  "norm_type": "rmsnorm",
+  "graph_template": {
+    "pre": [
+      {"op": "embed", "weight": "embed"}
+    ],
+    "per_layer": [
+      {"op": "rmsnorm", "input": "residual", "weight": "attn_norm"},
+      {"op": "matmul", "weight": "attn_q", "bias": "attn_q_bias", "label": "Q"},
+      {"op": "matmul", "weight": "attn_k", "bias": "attn_k_bias", "label": "K"},
+      {"op": "matmul", "weight": "attn_v", "bias": "attn_v_bias", "label": "V"},
+      {"op": "rope", "label": "RoPE"},
+      {"op": "attention", "type": "gqa", "label": "Grouped Query Attention"},
+      {"op": "matmul", "weight": "attn_output", "label": "Output Projection"},
+      {"op": "add", "label": "Residual"},
+      {"op": "rmsnorm", "weight": "ffn_norm"},
+      {"op": "matmul", "weight": "ffn_gate", "label": "Gate"},
+      {"op": "matmul", "weight": "ffn_up", "label": "Up"},
+      {"op": "silu_mul", "label": "SiLU Gate"},
+      {"op": "matmul", "weight": "ffn_down", "label": "Down"},
+      {"op": "add", "label": "Residual"}
+    ],
+    "post": [
+      {"op": "rmsnorm", "weight": "output_norm"},
+      {"op": "matmul", "weight": "output", "label": "LM Head"}
+    ]
+  }
+}

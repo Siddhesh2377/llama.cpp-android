@@ -4,7 +4,7 @@
 
 #include "types.h"
 
-// Build transformer forward pass graph with optional intervention surfaces
+// Build transformer forward pass graph (token-based input)
 struct ggml_cgraph * build_graph(
     struct ggml_context * ctx,
     ModelState & state,
@@ -12,10 +12,8 @@ struct ggml_cgraph * build_graph(
     int kv_pos,
     int kv_len,
     int n_layers,
-    bool need_argmax = true,
-    const InterventionConfig * iv = nullptr,
-    const InterventionTensors * iv_t = nullptr
+    bool need_argmax = false
 );
 
 // Compute context size needed for build_graph
-size_t compute_ctx_size(int n_layers, bool with_interventions = false);
+size_t compute_ctx_size(int n_layers);

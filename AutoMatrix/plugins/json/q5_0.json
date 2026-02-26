@@ -1,0 +1,15 @@
+{
+  "id": "q5_0",
+  "name": "Q5_0",
+  "version": "1.0",
+  "bits_per_weight": 5.0,
+  "block_size": 32,
+  "has_i8mm": true,
+  "quality_rating": 0.85,
+  "speed_rating": 1.0,
+  "description": "5-bit quantization. Sweet spot: good quality, near-50 tok/s. Recommended for SmolVLM-500M.",
+  "recommended": true,
+  "benchmarks": {
+    "smolvlm_500m": {"decode_tok_s": 47.9, "prefill_ms": 734, "weight_mb": 268.5, "bandwidth_gb_s": 13.8}
+  }
+}

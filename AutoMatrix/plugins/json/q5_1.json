@@ -1,0 +1,14 @@
+{
+  "id": "q5_1",
+  "name": "Q5_1",
+  "version": "1.0",
+  "bits_per_weight": 5.5,
+  "block_size": 32,
+  "has_i8mm": true,
+  "quality_rating": 0.88,
+  "speed_rating": 0.85,
+  "description": "5.5-bit quantization with min/max scaling. Slightly better quality than Q5_0 but slower.",
+  "benchmarks": {
+    "smolvlm_500m": {"decode_tok_s": 40.8, "weight_mb": 292.9, "bandwidth_gb_s": 12.4}
+  }
+}

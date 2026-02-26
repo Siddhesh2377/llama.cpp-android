@@ -1,0 +1,8 @@
+{
+  "id": "greedy",
+  "name": "Greedy",
+  "version": "1.0",
+  "description": "Always picks the highest-probability token. Deterministic, no randomness.",
+  "parameters": {},
+  "algorithm": "argmax"
+}

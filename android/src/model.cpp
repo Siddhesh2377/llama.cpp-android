@@ -12,7 +12,8 @@
 // --------------------------------------------------------------------------
 // Step 1: Load model
 // --------------------------------------------------------------------------
-bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t backend) {
+bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t backend,
+                ggml_type quant_type, ggml_type quant_ffn) {
     printf("\n=== Loading Model ===\n");
     auto t0 = Clock::now();
 
@@ -119,21 +120,40 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
 
     printf("  BOS=%d  EOS=%d\n", state.bos_token, state.eos_token);
 
-    // Count weight tensors: 3 global + 11 per layer (9 base + 2 optional qk_norm)
-    int n_weight_tensors = 3 + (int)cfg.n_layer * 11;
+    // Count weight tensors: 3 global + 8 per layer
+    // (attn_norm, attn_qkv, attn_output, q_norm, k_norm, ffn_norm, ffn_gate_up, ffn_down)
+    int n_weight_tensors = 3 + (int)cfg.n_layer * 8;
 
     // Create weight context (tensor metadata only, no data)
     size_t weight_ctx_size = (size_t)n_weight_tensors * ggml_tensor_overhead() + 256;
     struct ggml_init_params wparams = { weight_ctx_size, nullptr, true };
     state.weight_ctx = ggml_init(wparams);
 
-    // Helper: create tensor mirroring GGUF source, or return nullptr
-    auto make_weight = [&](const char * name) -> struct ggml_tensor * {
+    // Helper: create tensor mirroring GGUF source, with optional requantization
+    bool do_requant = (quant_type != GGML_TYPE_COUNT);
+    bool do_requant_ffn = (quant_ffn != GGML_TYPE_COUNT);
+    if (do_requant && do_requant_ffn) {
+        printf("  [REQUANT] Attn: %s, FFN: %s (mixed quantization)\n",
+            ggml_type_name(quant_type), ggml_type_name(quant_ffn));
+    } else if (do_requant) {
+        printf("  [REQUANT] Target: %s (from %s)\n",
+            ggml_type_name(quant_type), "Q8_0");
+    } else if (do_requant_ffn) {
+        printf("  [REQUANT] FFN only: %s (attention keeps original)\n",
+            ggml_type_name(quant_ffn));
+    }
+
+    auto make_weight = [&](const char * name, bool is_ffn = false) -> struct ggml_tensor * {
         struct ggml_tensor * src = ggml_get_tensor(data_ctx, name);
         if (!src) return nullptr;
         struct ggml_tensor * dst = nullptr;
+        ggml_type target = GGML_TYPE_COUNT;
+        if (is_ffn && do_requant_ffn) target = quant_ffn;
+        else if (do_requant) target = quant_type;
         if (ggml_n_dims(src) == 1) {
             dst = ggml_new_tensor_1d(state.weight_ctx, src->type, src->ne[0]);
+        } else if (target != GGML_TYPE_COUNT && ggml_is_quantized(src->type)) {
+            dst = ggml_new_tensor_2d(state.weight_ctx, target, src->ne[0], src->ne[1]);
         } else {
             dst = ggml_new_tensor_2d(state.weight_ctx, src->type, src->ne[0], src->ne[1]);
         }
@@ -144,7 +164,7 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
     // Global weights
     state.token_embd  = make_weight("token_embd.weight");
     state.output_norm = make_weight("output_norm.weight");
-    state.output      = make_weight("output.weight");
+    state.output      = make_weight("output.weight", true);  // lm_head: FFN-like, safe to quantize
 
     if (!state.token_embd) {
         printf("  FAIL: token_embd.weight not found\n");
@@ -175,15 +195,6 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
         snprintf(buf, sizeof(buf), "blk.%u.attn_norm.weight", il);
         lw.attn_norm = make_weight(buf);
 
-        snprintf(buf, sizeof(buf), "blk.%u.attn_q.weight", il);
-        lw.attn_q = make_weight(buf);
-
-        snprintf(buf, sizeof(buf), "blk.%u.attn_k.weight", il);
-        lw.attn_k = make_weight(buf);
-
-        snprintf(buf, sizeof(buf), "blk.%u.attn_v.weight", il);
-        lw.attn_v = make_weight(buf);
-
         snprintf(buf, sizeof(buf), "blk.%u.attn_output.weight", il);
         lw.attn_output = make_weight(buf);
 
@@ -200,17 +211,58 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
         snprintf(buf, sizeof(buf), "blk.%u.ffn_norm.weight", il);
         lw.ffn_norm = make_weight(buf);
 
-        snprintf(buf, sizeof(buf), "blk.%u.ffn_gate.weight", il);
-        lw.ffn_gate = make_weight(buf);
-
-        snprintf(buf, sizeof(buf), "blk.%u.ffn_up.weight", il);
-        lw.ffn_up = make_weight(buf);
-
         snprintf(buf, sizeof(buf), "blk.%u.ffn_down.weight", il);
-        lw.ffn_down = make_weight(buf);
+        lw.ffn_down = make_weight(buf, true);
 
-        if (!lw.attn_norm || !lw.attn_q || !lw.attn_k || !lw.attn_v ||
-            !lw.attn_output || !lw.ffn_norm || !lw.ffn_gate || !lw.ffn_up || !lw.ffn_down) {
+        // Create fused QKV weight: [n_embd, q_out + k_out + v_out]
+        // Read source tensor shapes from GGUF mmap (no allocation)
+        {
+            snprintf(buf, sizeof(buf), "blk.%u.attn_q.weight", il);
+            struct ggml_tensor * src_q = ggml_get_tensor(data_ctx, buf);
+            snprintf(buf, sizeof(buf), "blk.%u.attn_k.weight", il);
+            struct ggml_tensor * src_k = ggml_get_tensor(data_ctx, buf);
+            snprintf(buf, sizeof(buf), "blk.%u.attn_v.weight", il);
+            struct ggml_tensor * src_v = ggml_get_tensor(data_ctx, buf);
+
+            if (src_q && src_k && src_v) {
+                int64_t q_out = src_q->ne[1];
+                int64_t k_out = src_k->ne[1];
+                int64_t v_out = src_v->ne[1];
+                ggml_type wtype = do_requant ? quant_type : src_q->type;
+                lw.attn_qkv = ggml_new_tensor_2d(state.weight_ctx, wtype,
+                    cfg.n_embd, q_out + k_out + v_out);
+                snprintf(buf, sizeof(buf), "blk.%u.attn_qkv.weight", il);
+                ggml_set_name(lw.attn_qkv, buf);
+            }
+        }
+
+        // Create fused gate+up weight: [n_embd, 2 * n_ff]
+        {
+            snprintf(buf, sizeof(buf), "blk.%u.ffn_gate.weight", il);
+            struct ggml_tensor * src_gate = ggml_get_tensor(data_ctx, buf);
+            snprintf(buf, sizeof(buf), "blk.%u.ffn_up.weight", il);
+            struct ggml_tensor * src_up = ggml_get_tensor(data_ctx, buf);
+
+            if (src_gate && src_up) {
+                ggml_type wtype = src_gate->type;
+                if (do_requant_ffn) wtype = quant_ffn;
+                else if (do_requant) wtype = quant_type;
+                lw.ffn_gate_up = ggml_new_tensor_2d(state.weight_ctx, wtype,
+                    cfg.n_embd, 2 * (int64_t)cfg.n_ff);
+                snprintf(buf, sizeof(buf), "blk.%u.ffn_gate_up.weight", il);
+                ggml_set_name(lw.ffn_gate_up, buf);
+            }
+        }
+
+        // Individual Q/K/V/gate/up are NOT allocated (fused versions used instead)
+        lw.attn_q = nullptr;
+        lw.attn_k = nullptr;
+        lw.attn_v = nullptr;
+        lw.ffn_gate = nullptr;
+        lw.ffn_up = nullptr;
+
+        if (!lw.attn_norm || !lw.attn_qkv ||
+            !lw.attn_output || !lw.ffn_norm || !lw.ffn_gate_up || !lw.ffn_down) {
             printf("  [WARN] layer %u: missing tensors\n", il);
             missing++;
         }
@@ -222,16 +274,19 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
     }
 
     // Derive head_dim from actual Q weight shape if not set from GGUF key
-    // Q weight: [n_embd, n_head * head_dim] → head_dim = ne[1] / n_head
-    if (state.layers[0].attn_q && cfg.n_head > 0) {
-        uint32_t q_out_dim = (uint32_t)state.layers[0].attn_q->ne[1];
-        uint32_t derived_head_dim = q_out_dim / cfg.n_head;
-        if (derived_head_dim != cfg.head_dim) {
-            printf("  [INFO] head_dim corrected: %u -> %u (from Q weight [%lld, %lld])\n",
-                cfg.head_dim, derived_head_dim,
-                (long long)state.layers[0].attn_q->ne[0],
-                (long long)state.layers[0].attn_q->ne[1]);
-            cfg.head_dim = derived_head_dim;
+    // QKV fused: [n_embd, q_out + k_out + v_out] where q_out = n_head * head_dim
+    // Or individual Q: [n_embd, n_head * head_dim]
+    {
+        struct ggml_tensor * src_q = ggml_get_tensor(data_ctx, "blk.0.attn_q.weight");
+        if (src_q && cfg.n_head > 0) {
+            uint32_t q_out_dim = (uint32_t)src_q->ne[1];
+            uint32_t derived_head_dim = q_out_dim / cfg.n_head;
+            if (derived_head_dim != cfg.head_dim) {
+                printf("  [INFO] head_dim corrected: %u -> %u (from Q weight [%lld, %lld])\n",
+                    cfg.head_dim, derived_head_dim,
+                    (long long)src_q->ne[0], (long long)src_q->ne[1]);
+                cfg.head_dim = derived_head_dim;
+            }
         }
     }
 
@@ -251,8 +306,21 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
 
     auto copy_weight = [&](struct ggml_tensor * dst, const char * name) {
         struct ggml_tensor * src = ggml_get_tensor(data_ctx, name);
-        if (src && dst) {
+        if (!src || !dst) return;
+
+        if (dst->type == src->type) {
+            // Same type — direct copy
             ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+        } else {
+            // Requantize: src_type → F32 → dst_type
+            int64_t nels = ggml_nelements(src);
+            std::vector<float> f32(nels);
+            ggml_get_type_traits(src->type)->to_float(
+                (const void *)src->data, f32.data(), nels);
+            std::vector<uint8_t> dst_buf(ggml_nbytes(dst));
+            ggml_get_type_traits_cpu(dst->type)->from_float(
+                f32.data(), (void *)dst_buf.data(), nels);
+            ggml_backend_tensor_set(dst, dst_buf.data(), 0, ggml_nbytes(dst));
         }
     };
 
@@ -268,17 +336,93 @@ bool load_model(ModelState & state, const char * path, int fd, ggml_backend_t ba
 
     for (uint32_t il = 0; il < cfg.n_layer; il++) {
         char buf[128];
-        snprintf(buf, sizeof(buf), "blk.%u.attn_norm.weight", il);   copy_weight(state.layers[il].attn_norm, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.attn_q.weight", il);      copy_weight(state.layers[il].attn_q, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.attn_k.weight", il);      copy_weight(state.layers[il].attn_k, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.attn_v.weight", il);      copy_weight(state.layers[il].attn_v, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.attn_output.weight", il); copy_weight(state.layers[il].attn_output, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.attn_q_norm.weight", il); copy_weight(state.layers[il].q_norm, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.attn_k_norm.weight", il); copy_weight(state.layers[il].k_norm, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.ffn_norm.weight", il);    copy_weight(state.layers[il].ffn_norm, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.ffn_gate.weight", il);    copy_weight(state.layers[il].ffn_gate, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.ffn_up.weight", il);      copy_weight(state.layers[il].ffn_up, buf);
-        snprintf(buf, sizeof(buf), "blk.%u.ffn_down.weight", il);    copy_weight(state.layers[il].ffn_down, buf);
+        LayerWeights & lw = state.layers[il];
+
+        snprintf(buf, sizeof(buf), "blk.%u.attn_norm.weight", il);   copy_weight(lw.attn_norm, buf);
+        snprintf(buf, sizeof(buf), "blk.%u.attn_output.weight", il); copy_weight(lw.attn_output, buf);
+        snprintf(buf, sizeof(buf), "blk.%u.attn_q_norm.weight", il); copy_weight(lw.q_norm, buf);
+        snprintf(buf, sizeof(buf), "blk.%u.attn_k_norm.weight", il); copy_weight(lw.k_norm, buf);
+        snprintf(buf, sizeof(buf), "blk.%u.ffn_norm.weight", il);    copy_weight(lw.ffn_norm, buf);
+        snprintf(buf, sizeof(buf), "blk.%u.ffn_down.weight", il);    copy_weight(lw.ffn_down, buf);
+
+        // Copy fused QKV: assemble Q|K|V into CPU buffer, then single set_tensor
+        // (OpenCL Q8_0 SOA handler replaces tensor->extra on set, so partial
+        //  writes would corrupt the extra on subsequent calls)
+        if (lw.attn_qkv) {
+            snprintf(buf, sizeof(buf), "blk.%u.attn_q.weight", il);
+            struct ggml_tensor * src_q = ggml_get_tensor(data_ctx, buf);
+            snprintf(buf, sizeof(buf), "blk.%u.attn_k.weight", il);
+            struct ggml_tensor * src_k = ggml_get_tensor(data_ctx, buf);
+            snprintf(buf, sizeof(buf), "blk.%u.attn_v.weight", il);
+            struct ggml_tensor * src_v = ggml_get_tensor(data_ctx, buf);
+
+            if (src_q && src_k && src_v) {
+                size_t total_bytes = ggml_nbytes(lw.attn_qkv);
+                std::vector<uint8_t> qkv_buf(total_bytes, 0);
+                size_t off = 0;
+
+                auto copy_src = [&](struct ggml_tensor * src) {
+                    if (lw.attn_qkv->type == src->type) {
+                        memcpy(qkv_buf.data() + off, src->data, ggml_nbytes(src));
+                        off += ggml_nbytes(src);
+                    } else {
+                        int64_t nels_per_row = src->ne[0];
+                        int64_t nrows = src->ne[1];
+                        size_t row_bytes_src = ggml_row_size(src->type, nels_per_row);
+                        size_t row_bytes_dst = ggml_row_size(lw.attn_qkv->type, nels_per_row);
+                        std::vector<float> f32(nels_per_row);
+                        for (int64_t r = 0; r < nrows; r++) {
+                            ggml_get_type_traits(src->type)->to_float(
+                                (const uint8_t*)src->data + r * row_bytes_src, f32.data(), nels_per_row);
+                            ggml_get_type_traits_cpu(lw.attn_qkv->type)->from_float(
+                                f32.data(), qkv_buf.data() + off, nels_per_row);
+                            off += row_bytes_dst;
+                        }
+                    }
+                };
+                copy_src(src_q);
+                copy_src(src_k);
+                copy_src(src_v);
+                ggml_backend_tensor_set(lw.attn_qkv, qkv_buf.data(), 0, total_bytes);
+            }
+        }
+
+        // Copy fused gate+up: assemble gate|up into CPU buffer, then single set_tensor
+        if (lw.ffn_gate_up) {
+            snprintf(buf, sizeof(buf), "blk.%u.ffn_gate.weight", il);
+            struct ggml_tensor * src_gate = ggml_get_tensor(data_ctx, buf);
+            snprintf(buf, sizeof(buf), "blk.%u.ffn_up.weight", il);
+            struct ggml_tensor * src_up = ggml_get_tensor(data_ctx, buf);
+
+            if (src_gate && src_up) {
+                size_t total_bytes = ggml_nbytes(lw.ffn_gate_up);
+                std::vector<uint8_t> gu_buf(total_bytes, 0);
+                size_t off = 0;
+
+                auto copy_src = [&](struct ggml_tensor * src) {
+                    if (lw.ffn_gate_up->type == src->type) {
+                        memcpy(gu_buf.data() + off, src->data, ggml_nbytes(src));
+                        off += ggml_nbytes(src);
+                    } else {
+                        int64_t nels_per_row = src->ne[0];
+                        int64_t nrows = src->ne[1];
+                        size_t row_bytes_src = ggml_row_size(src->type, nels_per_row);
+                        size_t row_bytes_dst = ggml_row_size(lw.ffn_gate_up->type, nels_per_row);
+                        std::vector<float> f32(nels_per_row);
+                        for (int64_t r = 0; r < nrows; r++) {
+                            ggml_get_type_traits(src->type)->to_float(
+                                (const uint8_t*)src->data + r * row_bytes_src, f32.data(), nels_per_row);
+                            ggml_get_type_traits_cpu(lw.ffn_gate_up->type)->from_float(
+                                f32.data(), gu_buf.data() + off, nels_per_row);
+                            off += row_bytes_dst;
+                        }
+                    }
+                };
+                copy_src(src_gate);
+                copy_src(src_up);
+                ggml_backend_tensor_set(lw.ffn_gate_up, gu_buf.data(), 0, total_bytes);
+            }
+        }
     }
 
     auto t3 = Clock::now();
