@@ -16,11 +16,14 @@
 	import Outliner from '$lib/components/Outliner.svelte';
 	import Properties from '$lib/components/Properties.svelte';
 	import Console from '$lib/components/Console.svelte';
+	import NodePalette from '$lib/panels/NodePalette.svelte';
+	import Plugins from '$lib/views/Plugins.svelte';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import SettingsPanel from '$lib/components/SettingsPanel.svelte';
 	import NodeCanvas from '$lib/engine/NodeCanvas.svelte';
 
 	import { documents, activeDocId } from '$lib/engine/store';
+	import { devices } from '$lib/stores/device';
 	import { startPolling, stopPolling, getPlugins } from '$lib/api/client';
 	import { consoleStore } from '$lib/stores/console';
 	import { plugins } from '$lib/stores/plugins';
@@ -90,8 +93,26 @@
 				<div class="panel-content">
 					{#if $leftWindow.id === 'model'}
 						<Outliner />
+					{:else if $leftWindow.id === 'palette'}
+						<NodePalette />
+					{:else if $leftWindow.id === 'plugins'}
+						<Plugins />
+					{:else if $leftWindow.id === 'devices'}
+						<div class="device-list">
+							{#each $devices as dev (dev.serial)}
+								<div class="device-item">
+									<span class="device-status" class:online={dev.status === 'online'} class:offline={dev.status !== 'online'}></span>
+									<div class="device-info">
+										<div class="device-model">{dev.model}</div>
+										<div class="device-meta">{dev.serial} &middot; {dev.chipset}</div>
+									</div>
+								</div>
+							{:else}
+								<div style="padding:12px;color:var(--text-tertiary);font-size:11px">No devices connected</div>
+							{/each}
+						</div>
 					{:else}
-						<div class="placeholder-content">{$leftWindow.label}</div>
+						<div style="padding:12px;color:var(--text-tertiary);font-size:11px">{$leftWindow.label} — coming soon</div>
 					{/if}
 				</div>
 			</div>
@@ -132,7 +153,7 @@
 						{#if $bottomWindow.id === 'console'}
 							<Console />
 						{:else}
-							<div class="placeholder-content">{$bottomWindow.label}</div>
+							<div style="padding:12px;color:var(--text-tertiary);font-size:11px">{$bottomWindow.label} — coming soon</div>
 						{/if}
 					</div>
 				</div>
@@ -158,7 +179,7 @@
 					{#if $rightWindow.id === 'props'}
 						<Properties />
 					{:else}
-						<div class="placeholder-content">{$rightWindow.label}</div>
+						<div style="padding:12px;color:var(--text-tertiary);font-size:11px">{$rightWindow.label} — coming soon</div>
 					{/if}
 				</div>
 			</div>
@@ -342,5 +363,58 @@
 		font-size: 11px;
 		text-transform: uppercase;
 		letter-spacing: 0.08em;
+	}
+
+	.device-list {
+		display: flex;
+		flex-direction: column;
+		padding: 4px 0;
+	}
+
+	.device-item {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 10px;
+	}
+
+	.device-item:hover {
+		background: var(--bg-hover);
+	}
+
+	.device-status {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+
+	.device-status.online {
+		background: var(--green, #4caf50);
+	}
+
+	.device-status.offline {
+		background: var(--text-tertiary);
+	}
+
+	.device-info {
+		min-width: 0;
+	}
+
+	.device-model {
+		font-size: 11px;
+		font-weight: 500;
+		color: var(--text-primary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.device-meta {
+		font-size: 10px;
+		color: var(--text-tertiary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 </style>
