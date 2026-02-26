@@ -1,0 +1,14 @@
+{
+  "id": "q8_0",
+  "name": "Q8_0",
+  "version": "1.0",
+  "bits_per_weight": 8.5,
+  "block_size": 32,
+  "has_i8mm": true,
+  "quality_rating": 1.0,
+  "speed_rating": 0.69,
+  "description": "8-bit quantization. Best quality, bandwidth-limited on mobile. Base format for runtime requantization.",
+  "benchmarks": {
+    "smolvlm_500m": {"decode_tok_s": 33.1, "prefill_ms": 4305, "weight_mb": 414.9, "bandwidth_gb_s": 14.6}
+  }
+}

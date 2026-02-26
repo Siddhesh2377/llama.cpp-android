@@ -1,0 +1,22 @@
+{
+  "id": "cpu_neon",
+  "name": "ARM NEON I8MM",
+  "version": "1.0",
+  "description": "ARM CPU with NEON SIMD, I8MM int8 matmul, dotprod. Primary backend for mobile decode.",
+  "platform": "arm64",
+  "features": ["neon", "i8mm", "dotprod", "fp16"],
+  "supported_ops": ["matmul", "rmsnorm", "layernorm", "rope", "attention", "silu", "gelu", "add", "mul", "embed", "softmax"],
+  "supported_types": ["f32", "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1"],
+  "performance": {
+    "bandwidth_gb_s": 14.0,
+    "compute_gflops_per_core": 18,
+    "optimal_threads": 4,
+    "thread_affinity": "big_cores_only",
+    "notes": "BW-limited for Q8_0 decode, compute-limited for Q5_0+"
+  },
+  "constraints": {
+    "max_threads": 4,
+    "avoid_little_cores": true,
+    "min_alignment_bytes": 32
+  }
+}

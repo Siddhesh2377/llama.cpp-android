@@ -1,0 +1,6 @@
+server/build/
+web/node_modules/
+web/.svelte-kit/
+web/build/
+*.o
+*.so

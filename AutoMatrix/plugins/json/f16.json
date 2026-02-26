@@ -1,0 +1,12 @@
+{
+  "id": "f16",
+  "name": "F16",
+  "version": "1.0",
+  "bits_per_weight": 16.0,
+  "block_size": 1,
+  "has_i8mm": false,
+  "quality_rating": 0.99,
+  "speed_rating": 0.30,
+  "description": "Half-precision float. Near-lossless quality but 2x the memory of Q8_0. Used for KV cache.",
+  "benchmarks": {}
+}

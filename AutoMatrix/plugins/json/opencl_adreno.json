@@ -1,0 +1,21 @@
+{
+  "id": "opencl_adreno",
+  "name": "Adreno GPU (OpenCL)",
+  "version": "1.0",
+  "description": "Qualcomm Adreno GPU via OpenCL. Faster prefill but slower decode than CPU.",
+  "platform": "arm64",
+  "features": ["opencl", "adreno_kernels", "svm"],
+  "supported_ops": ["matmul", "rmsnorm", "add", "mul", "softmax", "rope"],
+  "supported_types": ["f32", "f16", "q8_0"],
+  "performance": {
+    "prefill_speedup": 2.8,
+    "decode_penalty": 0.68,
+    "notes": "3x faster prefill vs CPU Q8_0 (1513ms vs 4305ms), but decode only 23.1 tok/s vs 34.2"
+  },
+  "constraints": {
+    "q8_0_soa_format": true,
+    "single_set_tensor": true,
+    "subbuffer_alignment": true,
+    "notes": "Q8_0 SOA requires single set_tensor call; multi-call corrupts tensor->extra"
+  }
+}

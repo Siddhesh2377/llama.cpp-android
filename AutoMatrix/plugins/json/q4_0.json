@@ -1,0 +1,14 @@
+{
+  "id": "q4_0",
+  "name": "Q4_0",
+  "version": "1.0",
+  "bits_per_weight": 4.0,
+  "block_size": 32,
+  "has_i8mm": true,
+  "quality_rating": 0.55,
+  "speed_rating": 0.95,
+  "description": "4-bit quantization. Mediocre quality at 360M scale. Fast but lossy.",
+  "benchmarks": {
+    "smolvlm_500m": {"decode_tok_s": 48.5, "weight_mb": 219.7, "bandwidth_gb_s": 11.1}
+  }
+}

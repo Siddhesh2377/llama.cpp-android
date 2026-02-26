@@ -1,0 +1,59 @@
+{
+  "id": "llama",
+  "name": "LLaMA",
+  "version": "1.0",
+  "description": "Meta LLaMA architecture. Used by SmolLM2, LLaMA 2/3, Mistral, CodeLlama.",
+  "tensor_patterns": {
+    "embed": "token_embd.weight",
+    "attn_qkv": "blk.{L}.attn_qkv.weight",
+    "attn_q": "blk.{L}.attn_q.weight",
+    "attn_k": "blk.{L}.attn_k.weight",
+    "attn_v": "blk.{L}.attn_v.weight",
+    "attn_output": "blk.{L}.attn_output.weight",
+    "attn_norm": "blk.{L}.attn_norm.weight",
+    "ffn_gate": "blk.{L}.ffn_gate.weight",
+    "ffn_up": "blk.{L}.ffn_up.weight",
+    "ffn_down": "blk.{L}.ffn_down.weight",
+    "ffn_gate_up": "blk.{L}.ffn_gate_up.weight",
+    "ffn_norm": "blk.{L}.ffn_norm.weight",
+    "output_norm": "output_norm.weight",
+    "output": "output.weight"
+  },
+  "fusions": {
+    "attn_qkv": ["attn_q", "attn_k", "attn_v"],
+    "ffn_gate_up": ["ffn_gate", "ffn_up"]
+  },
+  "config_keys": {
+    "embedding_length": "u32",
+    "block_count": "u32",
+    "attention.head_count": "u32",
+    "attention.head_count_kv": "u32",
+    "context_length": "u32",
+    "feed_forward_length": "u32"
+  },
+  "attention": {"type": "grouped_query", "rope": true, "bias": false},
+  "activation": "silu",
+  "norm_type": "rmsnorm",
+  "graph_template": {
+    "pre": [
+      {"op": "embed", "weight": "embed"}
+    ],
+    "per_layer": [
+      {"op": "rmsnorm", "input": "residual", "weight": "attn_norm"},
+      {"op": "matmul", "weight": "attn_qkv", "label": "QKV Projection"},
+      {"op": "rope", "label": "RoPE"},
+      {"op": "attention", "type": "gqa", "label": "Grouped Query Attention"},
+      {"op": "matmul", "weight": "attn_output", "label": "Output Projection"},
+      {"op": "add", "label": "Residual"},
+      {"op": "rmsnorm", "weight": "ffn_norm"},
+      {"op": "matmul", "weight": "ffn_gate_up", "label": "Gate+Up"},
+      {"op": "silu_mul", "label": "SiLU Gate"},
+      {"op": "matmul", "weight": "ffn_down", "label": "Down Projection"},
+      {"op": "add", "label": "Residual"}
+    ],
+    "post": [
+      {"op": "rmsnorm", "weight": "output_norm"},
+      {"op": "matmul", "weight": "output", "label": "LM Head"}
+    ]
+  }
+}
