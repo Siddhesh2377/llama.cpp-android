@@ -31,6 +31,7 @@ set(VLM_SOURCES
 set(ENGINE_SOURCES
     ggml-engine.cpp
     ggml-engine-vlm.cpp
+    rag-engine.cpp
     tool-manager.cpp
     character-engine.cpp
     ${VLM_SOURCES}

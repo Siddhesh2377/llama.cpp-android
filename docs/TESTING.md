@@ -2,7 +2,7 @@
 
 ## Test CLI
 
-The test suite is built as `llama-test-cli` from `engine/llama-test-cli.cpp`. It validates all four engine components including VLM.
+The test suite is built as `llama-test-cli` from `engine/llama-test-cli.cpp`. It validates all five engine components: GGMLEngine, VLM, ToolManager, CharacterEngine, and RAG.
 
 ### Build
 
@@ -26,6 +26,12 @@ adb shell chmod +x /data/local/tmp/llama-test-cli
 # With VLM (vision) tests
 ./llama-test-cli -m /path/to/model.gguf --mmproj /path/to/mmproj.gguf --image /path/to/test.jpg
 
+# With RAG tests
+./llama-test-cli --embed-model /path/to/embedding-model.gguf
+
+# With RAG large file test
+./llama-test-cli --embed-model /path/to/embedding-model.gguf --rag-text /path/to/large-text.txt
+
 # Quick tests only (no model needed)
 ./llama-test-cli --quick
 
@@ -40,11 +46,16 @@ adb shell /data/local/tmp/llama-test-cli \
   -m /data/local/tmp/smolvlm-500m.gguf \
   --mmproj /data/local/tmp/mmproj-smolvlm-500m.gguf \
   --image /data/local/tmp/test.jpg
+
+# RAG tests on Android
+adb shell /data/local/tmp/llama-test-cli \
+  --embed-model /data/local/tmp/embeddinggemma-300M-Q4_0.gguf \
+  --rag-text /data/local/tmp/war-and-peace-excerpt.txt
 ```
 
 ### Test Coverage
 
-**61 tests** across 14 test groups:
+**62+ tests** across 18 test groups:
 
 | Group | Tests | Requires | What It Validates |
 |-------|-------|----------|-------------------|
@@ -64,6 +75,10 @@ adb shell /data/local/tmp/llama-test-cli \
 | Tool Call Generation | 2 | Model | Live model tool call, multi-tool parse |
 | Character Moods | 6 | Model | All 6 moods with live generation, temperature ordering |
 | Think/No-Think | 2 | Model (Qwen3) | `/think` mode with `<think>` tags, `/no_think` mode |
+| RAG Lifecycle + Errors | 2 | Nothing | Create/free, bad model path returns error |
+| RAG Model + Indexing | 3 | Embed model | Load model, add docs, query retrieval |
+| RAG Retrieval + Prompt | 3 | Embed model | Query returns ranked results, build_prompt, info JSON |
+| RAG Large File | 1 | Embed model + text | Bulk indexing, multi-query timing |
 
 ### Output
 
@@ -80,9 +95,9 @@ adb shell /data/local/tmp/llama-test-cli \
 [PASS] Engine reports model loaded
 [PASS] Context size > 0 (2048)
 
-... (61 tests total)
+... (62+ tests total)
 
-=== Results: 61/61 passed ===
+=== Results: 62/62 passed ===
 ```
 
 Exit code `0` = all passed, `1` = failures.
@@ -91,10 +106,11 @@ Exit code `0` = all passed, `1` = failures.
 
 | Mode | Flag | Tests | Time | Use Case |
 |------|------|-------|------|----------|
-| Full | `--all` (default) | 61 | ~10-20s | CI, release validation |
-| Full + VLM | `-m ... --mmproj ... --image ...` | 61 | ~15-30s | Full with vision tests |
-| Quick | `--quick` | 18 | <1s | Compile check, no model needed |
-| No model | `--no-model` | 18 | <1s | Same as quick |
+| Full | `--all` (default) | 62+ | ~10-20s | CI, release validation |
+| Full + VLM | `-m ... --mmproj ... --image ...` | 62+ | ~15-30s | Full with vision tests |
+| Full + RAG | `--embed-model ... --rag-text ...` | 62+ | ~20-40s | Full with RAG tests |
+| Quick | `--quick` | 20 | <1s | Compile check, no model needed |
+| No model | `--no-model` | 20 | <1s | Same as quick |
 
 ---
 
@@ -128,6 +144,7 @@ adb shell /data/local/tmp/llama-test-cli -m /data/local/tmp/qwen3-0.6b-q8_0.gguf
 | SmolVLM-500M + mmproj | ~500 MB + mmproj | 28 t/s | VLM testing |
 | Qwen3-0.6B Q8_0 | ~630 MB | 17-19 t/s | Primary test model (tool call, think) |
 | Gemma3-1B | ~1 GB | 14 t/s | Larger model validation |
+| EmbeddingGemma-300M Q4 | ~265 MB | ~25ms/query | RAG embedding model |
 
 ---
 
@@ -220,3 +237,21 @@ adb shell /data/local/tmp/llama-test-cli -m /data/local/tmp/qwen3-0.6b-q8_0.gguf
 ### Think/No-Think (Qwen3)
 - `/think` mode generates `<think>` tags with reasoning before answer
 - `/no_think` mode generates direct answer without reasoning tags
+
+### RAG Lifecycle + Errors
+- `rag_engine_create()` / `rag_engine_free()` don't crash
+- Bad model path returns `-1` (not a crash)
+
+### RAG Model + Indexing
+- `rag_engine_load_model()` loads embedding GGUF successfully
+- `rag_engine_add_document()` chunks and indexes documents
+- `rag_engine_query()` returns relevant results ranked by score
+
+### RAG Retrieval + Prompt
+- Query retrieves correct document for matching topic
+- `rag_engine_build_prompt()` produces augmented prompt with context
+- `rag_engine_info_json()` returns valid JSON with chunk/doc counts
+
+### RAG Large File
+- Indexes large text file (e.g., War and Peace excerpt) into 20+ chunks
+- Multi-query retrieval returns relevant chunks with timing

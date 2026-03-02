@@ -580,6 +580,156 @@ tool_manager_free(tm);
 
 ---
 
+## RAG Engine (`rag-engine.h`)
+
+Context-preserving retrieval-augmented generation. Uses a separate embedding model (e.g., EmbeddingGemma-300M) with late chunking for context-aware embeddings and binary quantization for compact storage. Model-agnostic: the RAG index survives LLM swaps.
+
+### Types
+
+#### `rag_engine_t`
+
+Opaque engine handle. Created with `rag_engine_create()`, destroyed with `rag_engine_free()`.
+
+#### `rag_engine_params`
+
+Engine configuration. Get defaults with `rag_engine_default_params()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `n_threads` | `int32_t` | 0 | Thread count (0 = auto-detect) |
+| `chunk_size` | `int32_t` | 256 | Tokens per chunk |
+| `chunk_overlap` | `int32_t` | 32 | Overlap tokens between chunks |
+| `n_dims` | `int32_t` | 256 | Matryoshka embedding dim: 768/512/256/128 |
+| `top_k` | `int32_t` | 32 | BQ search candidates before re-rank |
+| `top_n` | `int32_t` | 5 | Final results after cosine re-rank |
+| `late_chunking` | `bool` | true | Embed full doc then chunk (context-aware) |
+
+#### `rag_result`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `text` | `const char *` | Matched chunk text |
+| `doc_id` | `const char *` | Document identifier |
+| `chunk_index` | `int32_t` | Chunk index within document |
+| `score` | `float` | Cosine similarity score (0.0–1.0) |
+
+### Functions
+
+#### Lifecycle
+
+```c
+rag_engine_params  rag_engine_default_params(void);
+rag_engine_t *     rag_engine_create(rag_engine_params params);
+void               rag_engine_free(rag_engine_t * engine);
+```
+
+#### Embedding Model
+
+```c
+// Load embedding model from file path
+int32_t  rag_engine_load_model(rag_engine_t * engine, const char * path);
+
+// Load embedding model from file descriptor (Android SAF)
+int32_t  rag_engine_load_model_from_fd(rag_engine_t * engine, int fd);
+
+// Check if embedding model is loaded
+bool     rag_engine_is_loaded(const rag_engine_t * engine);
+```
+
+#### Indexing
+
+```c
+// Add document — chunks, embeds, and indexes it
+// Returns number of chunks created, or -1 on error
+int32_t  rag_engine_add_document(rag_engine_t * engine,
+             const char * text, const char * doc_id);
+
+// Remove document and all its chunks
+int32_t  rag_engine_remove_document(rag_engine_t * engine, const char * doc_id);
+
+// Clear all documents and chunks
+void     rag_engine_clear(rag_engine_t * engine);
+
+// Get counts
+int32_t  rag_engine_document_count(const rag_engine_t * engine);
+int32_t  rag_engine_chunk_count(const rag_engine_t * engine);
+```
+
+#### Retrieval
+
+```c
+// Query the index — returns ranked results by relevance
+// Two-stage: BQ Hamming search → cosine re-rank
+rag_result * rag_engine_query(rag_engine_t * engine,
+                 const char * query, int32_t * n_results);
+
+// Free query results
+void         rag_engine_free_results(rag_result * results, int32_t n);
+
+// Query + format into augmented prompt with retrieved context
+char *       rag_engine_build_prompt(rag_engine_t * engine,
+                 const char * query, const char * user_prompt);
+```
+
+#### Info
+
+```c
+// Get engine info as JSON (caller must free with rag_engine_free_string)
+char *       rag_engine_info_json(const rag_engine_t * engine);
+void         rag_engine_free_string(char * str);
+```
+
+### Usage Example
+
+```c
+#include "rag-engine.h"
+
+int main() {
+    // 1. Create engine
+    rag_engine_params params = rag_engine_default_params();
+    params.n_dims = 256;       // Matryoshka truncation
+    params.chunk_size = 256;   // tokens per chunk
+    rag_engine_t * rag = rag_engine_create(params);
+
+    // 2. Load embedding model
+    rag_engine_load_model(rag, "embeddinggemma-300m-q4.gguf");
+
+    // 3. Index documents
+    rag_engine_add_document(rag, "Mitochondria are the powerhouses...", "biology");
+    rag_engine_add_document(rag, "The French Revolution began in 1789...", "history");
+
+    // 4. Query
+    int32_t n = 0;
+    rag_result * results = rag_engine_query(rag, "cell energy", &n);
+    for (int i = 0; i < n; i++) {
+        printf("[%.3f] %s: %s\n", results[i].score, results[i].doc_id, results[i].text);
+    }
+    rag_engine_free_results(results, n);
+
+    // 5. Or build an augmented prompt for LLM generation
+    char * prompt = rag_engine_build_prompt(rag, "cell energy",
+        "Answer the question based on the context above.");
+    printf("%s\n", prompt);
+    rag_engine_free_string(prompt);
+
+    rag_engine_free(rag);
+}
+```
+
+### How It Works
+
+1. **Late Chunking**: Full document is embedded with bidirectional attention first, then token embeddings are chunked. This preserves cross-chunk context (e.g., pronoun references).
+
+2. **Matryoshka Truncation**: 768-dim embeddings truncated to `n_dims` (e.g., 256) without retraining. 3x compression with minimal quality loss.
+
+3. **Binary Quantization**: Float embeddings thresholded at 0 → 1-bit vectors. 32x compression. Hamming distance via `__builtin_popcountll` for fast candidate search.
+
+4. **Two-Stage Retrieval**: BQ Hamming search finds `top_k` candidates (fast), then cosine similarity re-ranks to `top_n` final results (accurate).
+
+5. **Sliding Window**: Documents longer than model context (2048 tokens) are processed in overlapping windows with averaged overlap regions.
+
+---
+
 ## CharacterEngine (`character-engine.h`)
 
 Personality and behavior control via sampling parameter modulation and logit-level manipulation. Works with any model without modifying system prompts or chat templates.

@@ -164,8 +164,8 @@ These are set by the consuming `gguf_lib/CMakeLists.txt` for maximum performance
 | `ggml` | Static lib | GGML tensor library (CPU backend) |
 | `llama` | Static lib | Model loading, tokenization, inference, sampling |
 | `common` | Static lib | Chat templates, JSON schema, sampling, ngram cache |
-| `tn-engine` | Static lib | GGMLEngine, VLM Engine, ToolManager, CharacterEngine |
-| `llama-test-cli` | Executable | Test suite (61 tests) |
+| `tn-engine` | Static lib | GGMLEngine, VLM Engine, ToolManager, CharacterEngine, RAG Engine |
+| `llama-test-cli` | Executable | Test suite (62+ tests) |
 
 ---
 

@@ -14,6 +14,7 @@ Tested on **Cortex-X3** (armv9-a, i8mm, bf16, NEON, dotprod):
 | SmolVLM-500M | VLM | Q8_0 | ~22 t/s (w/ image) | 28 t/s | 2048 |
 | Qwen3-0.6B | Text | Q8_0 | ~350 t/s | 17-19 t/s | 2048 |
 | Gemma3-1B | Text | Q4_K_M | ~250 t/s | 14 t/s | 2048 |
+| EmbeddingGemma-300M | RAG | Q4_0 | ~25ms/query | N/A | 2048 |
 
 ---
 
@@ -121,6 +122,40 @@ Performance:
 - **1.3-2x speedup** for JSON, code, and repetitive text
 - **No speedup** for creative/novel text (n-gram cache misses)
 - **Zero overhead** when disabled (opt-in via `setSpeculativeDecoding()`)
+
+---
+
+## RAG Performance
+
+### Embedding Model
+
+EmbeddingGemma-300M Q4_0 (~265 MB), 768 native dims, 2048 context.
+
+| Operation | Time (Cortex-X3) | Notes |
+|-----------|-------------------|-------|
+| Model load | ~1-2s | mmap'd, fast cold start |
+| Document indexing (1 chunk) | ~50-100ms | Tokenize + encode + pool + BQ |
+| Query (25 chunks indexed) | ~25ms | Encode query + Hamming search + cosine re-rank |
+| Query (100 chunks indexed) | ~30ms | BQ pre-filter keeps it fast |
+
+### Memory
+
+| Component | Size |
+|-----------|------|
+| Embedding model (mmap) | ~265 MB virtual, ~50 MB resident |
+| Per chunk (256 dims) | ~1 KB float + 4 words BQ = ~1.04 KB |
+| 1000 chunks | ~1 MB |
+| 10000 chunks | ~10 MB |
+
+### Tuning Parameters
+
+| Parameter | Effect | Recommendation |
+|-----------|--------|----------------|
+| `n_dims` | Lower = faster search, less accurate | 256 (good balance) |
+| `chunk_size` | Smaller = more chunks, finer retrieval | 256 (default) |
+| `top_k` | More BQ candidates = slower, more accurate re-rank | 32 (default) |
+| `top_n` | More final results | 5 (default) |
+| `late_chunking` | Better quality, slightly slower indexing | true (default) |
 
 ---
 

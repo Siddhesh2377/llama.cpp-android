@@ -14,11 +14,11 @@
 │  Zero-copy ByteBuffer · Ngram speculation        │
 ├─────────────────────────────────────────────────┤
 │              Engine Layer (engine/)               │
-│  ┌──────────┬──────────┬───────────┬───────────┐  │
-│  │GGMLEngine│VLM Engine│ToolManager│CharEngine │  │
-│  │Load/Gen  │Vision/   │JSON/XML/  │Mood/Logit │  │
-│  │KV Cache  │Audio     │Fn parse   │Bias/Uncen │  │
-│  └────┬─────┴────┬─────┴─────┬─────┴─────┬────┘  │
+│  ┌─────────┬─────────┬──────────┬────────┬──────┐ │
+│  │GGMLEng  │VLM Eng  │ToolMgr   │CharEng │RAGEng│ │
+│  │Load/Gen │Vision/  │JSON/XML/ │Mood/   │Late  │ │
+│  │KV Cache │Audio    │Fn parse  │Bias    │Chunk │ │
+│  └───┬─────┴───┬─────┴────┬─────┴───┬────┴──┬──┘ │
 ├─────────┼─────────────┼──────────────┼──────────┤
 │         │    llama.cpp Core (src/)   │           │
 │  Model loading · Tokenization · Inference ·      │
@@ -45,6 +45,7 @@ llama.cpp/
 │   ├── ggml-engine.h/.cpp     Model lifecycle, generation, context
 │   ├── ggml-engine-vlm.cpp    VLM generation (text + images)
 │   ├── ggml-engine-internal.h Shared structs and generation loop
+│   ├── rag-engine.h/.cpp      RAG: late chunking, BQ search, retrieval
 │   ├── tool-manager.h/.cpp    Tool call parsing and execution
 │   ├── character-engine.h/.cpp Personality, mood, uncensored mode
 │   ├── vlm/                   Vision/audio encoder (mtmd library)
@@ -53,7 +54,8 @@ llama.cpp/
 │   │   ├── mtmd-helper.h/.cpp Image/audio loading (stb_image, miniaudio)
 │   │   ├── mtmd-audio.h/.cpp  Mel spectrogram, audio preprocessing
 │   │   └── models/            20+ VLM graph builders (LLaVA, Qwen, etc.)
-│   ├── llama-test-cli.cpp     61-test validation suite
+│   ├── rag-tests.inc          RAG test functions (included by test CLI)
+│   ├── llama-test-cli.cpp     62-test validation suite
 │   └── CMakeLists.txt         Builds libtn-engine.a
 │
 ├── src/                       llama.cpp core
@@ -200,6 +202,43 @@ User message + tool definitions
 │              │
 │ 5. Feed result back to engine for next turn
 └──────────────┘
+```
+
+---
+
+## Data Flow: RAG (Retrieval-Augmented Generation)
+
+```
+Documents + embedding model
+    │
+    ▼
+┌─────────────────────┐
+│ RAG Engine            │
+│                       │
+│ Indexing:             │
+│ 1. Load embedding model (EmbeddingGemma-300M Q4)
+│ 2. rag_engine_add_document(text, doc_id)
+│    → Tokenize document
+│    → Late chunking: encode full doc with bidirectional attn
+│    → Split token embeddings into chunks (256 tokens, 32 overlap)
+│    → Mean pool + Matryoshka truncate (768→256 dims)
+│    → L2 normalize → float embedding
+│    → Binary quantize → 1-bit BQ vector
+│    → Store both float + BQ per chunk
+│                       │
+│ Query:                │
+│ 3. rag_engine_query(query)
+│    → Embed query (same pipeline)
+│    → Stage 1: BQ Hamming distance → top_k candidates (fast)
+│    → Stage 2: Cosine similarity re-rank → top_n results (accurate)
+│    → Return ranked rag_result array
+│                       │
+│ Prompt building:      │
+│ 4. rag_engine_build_prompt(query, user_prompt)
+│    → Query → retrieve top results
+│    → Format: "Context:\n[chunk1]\n[chunk2]\n...\n\nuser_prompt"
+│    → Pass to GGMLEngine for generation
+└───────────────────────┘
 ```
 
 ---

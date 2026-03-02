@@ -1,6 +1,7 @@
 #include "ggml-engine.h"
 #include "tool-manager.h"
 #include "character-engine.h"
+#include "rag-engine.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -9,6 +10,7 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <chrono>
 
 // ANSI colors for terminal output
 #define CLR_RESET  "\033[0m"
@@ -781,12 +783,16 @@ static void test_think_no_think(const char * model_path) {
     ggml_engine_free(engine);
 }
 
+#include "rag-tests.inc"
+
 static void print_usage(const char * prog) {
     printf("Usage: %s -m <model_path> [options]\n", prog);
     printf("\nOptions:\n");
     printf("  -m <path>        Path to GGUF model file (required for model tests)\n");
     printf("  --mmproj <path>  Path to mmproj GGUF file (required for VLM tests)\n");
     printf("  --image <path>   Path to test image file (required for VLM encode/gen)\n");
+    printf("  --embed-model <path>  Path to embedding model GGUF (for RAG tests)\n");
+    printf("  --rag-text <path>    Path to text file for RAG large file test\n");
     printf("  --all            Run all tests (default)\n");
     printf("  --no-model       Skip tests that require a model\n");
     printf("  --quick          Quick test (lifecycle + tool + character only)\n");
@@ -797,6 +803,8 @@ int main(int argc, char ** argv) {
     const char * model_path = nullptr;
     const char * mmproj_path = nullptr;
     const char * image_path = nullptr;
+    const char * embed_model_path = nullptr;
+    const char * rag_text_path = nullptr;
     bool run_model_tests = true;
     bool quick_mode = false;
 
@@ -807,6 +815,10 @@ int main(int argc, char ** argv) {
             mmproj_path = argv[++i];
         } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
             image_path = argv[++i];
+        } else if (strcmp(argv[i], "--embed-model") == 0 && i + 1 < argc) {
+            embed_model_path = argv[++i];
+        } else if (strcmp(argv[i], "--rag-text") == 0 && i + 1 < argc) {
+            rag_text_path = argv[++i];
         } else if (strcmp(argv[i], "--no-model") == 0) {
             run_model_tests = false;
         } else if (strcmp(argv[i], "--quick") == 0) {
@@ -861,6 +873,24 @@ int main(int argc, char ** argv) {
         }
     } else if (run_model_tests && !model_path) {
         print_info("Skipping model tests (no -m <path> provided)");
+    }
+
+    // RAG tests (always run lifecycle + errors, embed-model tests need model)
+    test_rag_lifecycle();
+    test_rag_errors();
+    if (embed_model_path) {
+        test_rag_model_loading(embed_model_path);
+        if (!quick_mode) {
+            test_rag_indexing(embed_model_path);
+            test_rag_retrieval(embed_model_path);
+            test_rag_build_prompt(embed_model_path);
+            test_rag_info(embed_model_path);
+        }
+        if (rag_text_path) {
+            test_rag_large_file(embed_model_path, rag_text_path);
+        }
+    } else {
+        print_info("Skipping RAG model tests (no --embed-model provided)");
     }
 
     // Summary

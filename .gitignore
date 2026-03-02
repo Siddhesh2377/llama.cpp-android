@@ -31,6 +31,9 @@ models/
 *.gguf
 *.gguf.json
 
+# Plans (local design docs)
+docs/plans/
+
 # Python
 __pycache__/
 .venv/
