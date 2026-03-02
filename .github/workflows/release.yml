@@ -1,0 +1,117 @@
+name: Build Android
+
+on:
+  push:
+    branches: [re-write, master]
+    tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'engine/**'
+      - 'vendor/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+  pull_request:
+    branches: [re-write, master]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'engine/**'
+      - 'vendor/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Android ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            extra_cmake: >-
+              -DGGML_CPU_ARM_ARCH=armv8.6-a+i8mm+dotprod+fp16
+              -DGGML_CPU_KLEIDIAI=ON
+          - abi: x86_64
+            extra_cmake: >-
+              -DGGML_CPU_KLEIDIAI=OFF
+
+    env:
+      NDK_VERSION: '27.3.13750724'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Configure CMake
+        env:
+          ABI: ${{ matrix.abi }}
+          EXTRA_CMAKE: ${{ matrix.extra_cmake }}
+        run: |
+          NDK_PATH="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${ABI}" \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_BUILD_COMMON=ON \
+            -DLLAMA_OPENSSL=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CPU=ON \
+            ${EXTRA_CMAKE}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Package libraries
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          mkdir -p dist/${ABI}
+          find build -name '*.a' -exec cp {} dist/${ABI}/ \;
+          find build -name '*.so' -exec cp {} dist/${ABI}/ \;
+          cp -r include dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-${{ matrix.abi }}
+          path: dist/
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release
+        run: |
+          mkdir -p release
+          for dir in artifacts/llama-cpp-*; do
+            cp -r "$dir"/* release/
+          done
+          cd release && tar czf ../llama-cpp-android.tar.gz .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: llama-cpp-android.tar.gz
+          generate_release_notes: true

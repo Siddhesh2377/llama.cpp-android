@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+build-android/
+*.o
+*.a
+*.so
+*.d
+
+# IDE / OS
+.cache/
+.ccls-cache/
+.idea/
+.vs/
+.vscode/
+.windsurf/
+*.swp
+.DS_Store
+Thumbs.db
+*.code-workspace
+
+# Generated
+common/build-info.cpp
+autogen-*.md
+*.log
+*.tmp
+
+# Models (download separately)
+models/
+!engine/vlm/models/
+!src/models/
+*.gguf
+*.gguf.json
+
+# Python
+__pycache__/
+.venv/
