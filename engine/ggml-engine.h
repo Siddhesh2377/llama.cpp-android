@@ -135,13 +135,19 @@ typedef struct {
     int32_t  image_max_tokens;   // -1 = model default
 } ggml_engine_vlm_params;
 
-// Image data: either file bytes (width=0, height=0) or raw RGB pixels
+// Media data: file bytes (image/audio, width=0 or height=0) or raw RGB pixels
 typedef struct {
     const unsigned char * data;   // file bytes or RGB pixels
     size_t                size;   // byte count
-    uint32_t              width;  // 0 = file mode (auto-detect JPEG/PNG/etc)
+    uint32_t              width;  // 0 = file mode (auto-detect media bytes)
     uint32_t              height; // 0 = file mode
 } ggml_engine_image;
+
+// Audio data: encoded file bytes (WAV/MP3/FLAC/etc. supported by miniaudio)
+typedef struct {
+    const unsigned char * data;
+    size_t                size;
+} ggml_engine_audio;
 
 // Get default VLM parameters
 ggml_engine_vlm_params ggml_engine_vlm_default_params(void);
@@ -168,6 +174,16 @@ ggml_engine_status  ggml_engine_vlm_generate(
 int32_t             ggml_engine_vlm_encode_image(
     ggml_engine_vlm_t * vlm, const ggml_engine_image * image);
 
+// Convenience audio helpers. Audio inputs are passed as encoded file bytes.
+ggml_engine_status  ggml_engine_vlm_generate_audio(
+    ggml_engine_t * engine, ggml_engine_vlm_t * vlm,
+    const char * prompt,
+    const ggml_engine_audio * audio, int32_t n_audio,
+    ggml_engine_sampling sampling,
+    ggml_engine_token_callback callback, void * user_data);
+int32_t             ggml_engine_vlm_encode_audio(
+    ggml_engine_vlm_t * vlm, const ggml_engine_audio * audio);
+
 // VLM info - returns JSON string (caller must free with ggml_engine_free_string)
 char *              ggml_engine_vlm_info_json(const ggml_engine_vlm_t * vlm);
 
@@ -177,6 +193,7 @@ const char *        ggml_engine_vlm_default_marker(void);
 // Capability queries
 bool                ggml_engine_vlm_supports_vision(const ggml_engine_vlm_t * vlm);
 bool                ggml_engine_vlm_supports_audio(const ggml_engine_vlm_t * vlm);
+int32_t             ggml_engine_vlm_audio_bitrate(const ggml_engine_vlm_t * vlm);
 
 #ifdef __cplusplus
 }
