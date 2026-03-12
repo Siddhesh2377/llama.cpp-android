@@ -135,11 +135,11 @@ typedef struct {
     int32_t  image_max_tokens;   // -1 = model default
 } ggml_engine_vlm_params;
 
-// Media data: file bytes (image/audio, width=0 + height=0) or raw RGB pixels
+// Media data: file bytes (image/audio, width=0 or height=0) or raw RGB pixels
 typedef struct {
     const unsigned char * data;   // file bytes or RGB pixels
     size_t                size;   // byte count
-    uint32_t              width;  // 0 = file mode (auto-detect JPEG/PNG/etc)
+    uint32_t              width;  // 0 = file mode (auto-detect media bytes)
     uint32_t              height; // 0 = file mode
 } ggml_engine_image;
 

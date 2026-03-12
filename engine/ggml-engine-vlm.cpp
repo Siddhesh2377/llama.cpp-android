@@ -181,21 +181,23 @@ ggml_engine_status ggml_engine_vlm_generate(
     return ggml_engine_generate_loop(engine, sampling, callback, user_data);
 }
 
-int32_t ggml_engine_vlm_encode_image(
-    ggml_engine_vlm_t * vlm, const ggml_engine_image * image)
-{
-    if (!vlm || !vlm->mtmd_ctx || !image) return -1;
-
-    // create bitmap
-    mtmd_bitmap * bmp = nullptr;
-    if (image->width == 0 || image->height == 0) {
-        bmp = mtmd_helper_bitmap_init_from_buf(vlm->mtmd_ctx, image->data, image->size);
-    } else {
-        bmp = mtmd_bitmap_init(image->width, image->height, image->data);
+static int32_t count_media_tokens(mtmd_input_chunks * chunks, mtmd_input_chunk_type chunk_type) {
+    int32_t n_tokens = 0;
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    for (size_t i = 0; i < n_chunks; i++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(chunk) == chunk_type) {
+            n_tokens += (int32_t) mtmd_input_chunk_get_n_tokens(chunk);
+        }
     }
-    if (!bmp) return -1;
+    return n_tokens;
+}
 
-    // tokenize with a simple marker prompt to get token count
+static int32_t tokenize_media_tokens(
+    ggml_engine_vlm_t * vlm, mtmd_bitmap * bmp, mtmd_input_chunk_type chunk_type)
+{
+    if (!vlm || !vlm->mtmd_ctx || !bmp) return -1;
+
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     mtmd_input_text input_text;
     const char * marker = mtmd_default_marker();
@@ -214,18 +216,30 @@ int32_t ggml_engine_vlm_encode_image(
         return -1;
     }
 
-    // count image tokens from chunks
-    int32_t n_image_tokens = 0;
-    size_t n_chunks = mtmd_input_chunks_size(chunks);
-    for (size_t i = 0; i < n_chunks; i++) {
-        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
-        if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-            n_image_tokens += (int32_t)mtmd_input_chunk_get_n_tokens(chunk);
-        }
-    }
-
+    const int32_t n_tokens = count_media_tokens(chunks, chunk_type);
     mtmd_input_chunks_free(chunks);
-    return n_image_tokens;
+    return n_tokens;
+}
+
+static bool is_valid_audio_buffer(const ggml_engine_audio * audio) {
+    return audio && audio->data != nullptr && audio->size > 0;
+}
+
+int32_t ggml_engine_vlm_encode_image(
+    ggml_engine_vlm_t * vlm, const ggml_engine_image * image)
+{
+    if (!vlm || !vlm->mtmd_ctx || !image) return -1;
+
+    // create bitmap
+    mtmd_bitmap * bmp = nullptr;
+    if (image->width == 0 || image->height == 0) {
+        bmp = mtmd_helper_bitmap_init_from_buf(vlm->mtmd_ctx, image->data, image->size);
+    } else {
+        bmp = mtmd_bitmap_init(image->width, image->height, image->data);
+    }
+    if (!bmp) return -1;
+
+    return tokenize_media_tokens(vlm, bmp, MTMD_INPUT_CHUNK_TYPE_IMAGE);
 }
 
 ggml_engine_status ggml_engine_vlm_generate_audio(
@@ -235,13 +249,16 @@ ggml_engine_status ggml_engine_vlm_generate_audio(
     ggml_engine_sampling sampling,
     ggml_engine_token_callback callback, void * user_data)
 {
-    if (!audio && n_audio > 0) {
+    if (n_audio < 0 || (!audio && n_audio > 0)) {
         return GGML_ENGINE_ERROR_VLM_ENCODE;
     }
 
     std::vector<ggml_engine_image> media;
     media.reserve(n_audio > 0 ? static_cast<size_t>(n_audio) : 0U);
     for (int32_t i = 0; i < n_audio; ++i) {
+        if (!is_valid_audio_buffer(&audio[i])) {
+            return GGML_ENGINE_ERROR_VLM_ENCODE;
+        }
         media.push_back(ggml_engine_image_from_audio(audio[i]));
     }
 
@@ -259,9 +276,12 @@ ggml_engine_status ggml_engine_vlm_generate_audio(
 int32_t ggml_engine_vlm_encode_audio(
     ggml_engine_vlm_t * vlm, const ggml_engine_audio * audio)
 {
-    if (!audio) return -1;
-    const auto image = ggml_engine_image_from_audio(*audio);
-    return ggml_engine_vlm_encode_image(vlm, &image);
+    if (!vlm || !vlm->mtmd_ctx || !is_valid_audio_buffer(audio)) return -1;
+
+    mtmd_bitmap * bmp = mtmd_helper_bitmap_init_from_buf(vlm->mtmd_ctx, audio->data, audio->size);
+    if (!bmp) return -1;
+
+    return tokenize_media_tokens(vlm, bmp, MTMD_INPUT_CHUNK_TYPE_AUDIO);
 }
 
 char * ggml_engine_vlm_info_json(const ggml_engine_vlm_t * vlm) {

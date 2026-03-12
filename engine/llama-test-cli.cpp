@@ -548,6 +548,7 @@ static void test_vlm_audio_generation(const char * model_path, const char * mmpr
     auto * vlm = ggml_engine_vlm_load(engine, mmproj_path, vlm_params);
 
     auto audio_bytes = load_file_bytes(audio_path);
+    TEST_ASSERT(!audio_bytes.empty(), "vlm: audio file loaded", "failed to read audio file");
 
     ggml_engine_audio audio;
     audio.data = audio_bytes.data();
