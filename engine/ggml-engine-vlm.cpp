@@ -80,6 +80,15 @@ bool ggml_engine_vlm_is_loaded(const ggml_engine_vlm_t * vlm) {
     return vlm && vlm->mtmd_ctx;
 }
 
+static ggml_engine_image ggml_engine_image_from_audio(const ggml_engine_audio & audio) {
+    ggml_engine_image image{};
+    image.data = audio.data;
+    image.size = audio.size;
+    image.width = 0;
+    image.height = 0;
+    return image;
+}
+
 ggml_engine_status ggml_engine_vlm_generate(
     ggml_engine_t * engine, ggml_engine_vlm_t * vlm,
     const char * prompt,
@@ -219,6 +228,42 @@ int32_t ggml_engine_vlm_encode_image(
     return n_image_tokens;
 }
 
+ggml_engine_status ggml_engine_vlm_generate_audio(
+    ggml_engine_t * engine, ggml_engine_vlm_t * vlm,
+    const char * prompt,
+    const ggml_engine_audio * audio, int32_t n_audio,
+    ggml_engine_sampling sampling,
+    ggml_engine_token_callback callback, void * user_data)
+{
+    if (!audio && n_audio > 0) {
+        return GGML_ENGINE_ERROR_VLM_ENCODE;
+    }
+
+    std::vector<ggml_engine_image> media;
+    media.reserve(n_audio > 0 ? static_cast<size_t>(n_audio) : 0U);
+    for (int32_t i = 0; i < n_audio; ++i) {
+        media.push_back(ggml_engine_image_from_audio(audio[i]));
+    }
+
+    return ggml_engine_vlm_generate(
+        engine,
+        vlm,
+        prompt,
+        media.empty() ? nullptr : media.data(),
+        n_audio,
+        sampling,
+        callback,
+        user_data);
+}
+
+int32_t ggml_engine_vlm_encode_audio(
+    ggml_engine_vlm_t * vlm, const ggml_engine_audio * audio)
+{
+    if (!audio) return -1;
+    const auto image = ggml_engine_image_from_audio(*audio);
+    return ggml_engine_vlm_encode_image(vlm, &image);
+}
+
 char * ggml_engine_vlm_info_json(const ggml_engine_vlm_t * vlm) {
     if (!vlm || !vlm->mtmd_ctx) return strdup_alloc("{}");
 
@@ -247,4 +292,9 @@ bool ggml_engine_vlm_supports_vision(const ggml_engine_vlm_t * vlm) {
 bool ggml_engine_vlm_supports_audio(const ggml_engine_vlm_t * vlm) {
     if (!vlm || !vlm->mtmd_ctx) return false;
     return mtmd_support_audio(vlm->mtmd_ctx);
+}
+
+int32_t ggml_engine_vlm_audio_bitrate(const ggml_engine_vlm_t * vlm) {
+    if (!vlm || !vlm->mtmd_ctx) return -1;
+    return mtmd_get_audio_bitrate(vlm->mtmd_ctx);
 }

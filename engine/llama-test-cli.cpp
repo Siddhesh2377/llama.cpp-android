@@ -412,6 +412,7 @@ static void test_vlm_info(const char * model_path, const char * mmproj_path) {
     char * info = ggml_engine_vlm_info_json(vlm);
     TEST_ASSERT(info != nullptr, "vlm info not null", "returned null");
     TEST_ASSERT(strstr(info, "supports_vision") != nullptr, "vlm info has supports_vision", "missing field");
+    TEST_ASSERT(strstr(info, "supports_audio") != nullptr, "vlm info has supports_audio", "missing field");
     print_info("VLM info: %s", info);
     ggml_engine_free_string(info);
 
@@ -419,6 +420,7 @@ static void test_vlm_info(const char * model_path, const char * mmproj_path) {
     const char * marker = ggml_engine_vlm_default_marker();
     TEST_ASSERT(marker != nullptr && strlen(marker) > 0, "vlm default marker", "empty marker");
     print_info("Default marker: %s", marker);
+    print_info("Audio bitrate: %d", ggml_engine_vlm_audio_bitrate(vlm));
 
     ggml_engine_vlm_free(vlm);
     ggml_engine_free(engine);
@@ -505,6 +507,80 @@ static void test_vlm_generation(const char * model_path, const char * mmproj_pat
     ggml_engine_free(engine);
 }
 
+// ---- Test: VLM Audio Encode ----
+static void test_vlm_audio_encode(const char * model_path, const char * mmproj_path, const char * audio_path) {
+    print_header("VLM Audio Encode");
+
+    auto params = ggml_engine_default_params();
+    params.n_ctx = 4096;
+    auto * engine = ggml_engine_create(params);
+    ggml_engine_load_model(engine, model_path);
+
+    auto vlm_params = ggml_engine_vlm_default_params();
+    auto * vlm = ggml_engine_vlm_load(engine, mmproj_path, vlm_params);
+
+    auto audio_bytes = load_file_bytes(audio_path);
+    TEST_ASSERT(!audio_bytes.empty(), "vlm: audio file loaded", "failed to read audio file");
+
+    ggml_engine_audio audio;
+    audio.data = audio_bytes.data();
+    audio.size = audio_bytes.size();
+
+    int32_t n_tokens = ggml_engine_vlm_encode_audio(vlm, &audio);
+    TEST_ASSERT(n_tokens > 0, "vlm: audio encode returns positive tokens", "expected > 0");
+    print_info("Audio encoded to %d tokens", n_tokens);
+
+    ggml_engine_vlm_free(vlm);
+    ggml_engine_free(engine);
+}
+
+// ---- Test: VLM Audio Generation ----
+static void test_vlm_audio_generation(const char * model_path, const char * mmproj_path, const char * audio_path) {
+    print_header("VLM Audio Generation");
+
+    auto params = ggml_engine_default_params();
+    params.n_ctx = 4096;
+    params.n_threads = 4;
+    auto * engine = ggml_engine_create(params);
+    ggml_engine_load_model(engine, model_path);
+
+    auto vlm_params = ggml_engine_vlm_default_params();
+    auto * vlm = ggml_engine_vlm_load(engine, mmproj_path, vlm_params);
+
+    auto audio_bytes = load_file_bytes(audio_path);
+
+    ggml_engine_audio audio;
+    audio.data = audio_bytes.data();
+    audio.size = audio_bytes.size();
+
+    const char * marker = ggml_engine_vlm_default_marker();
+    std::string prompt = std::string(marker) + "\nTranscribe this audio.";
+
+    auto sampling = ggml_engine_default_sampling();
+    sampling.n_predict = 64;
+    sampling.temperature = 0.1f;
+
+    std::string output;
+    printf("  VLM audio output: ");
+    auto status = ggml_engine_vlm_generate_audio(engine, vlm, prompt.c_str(),
+        &audio, 1, sampling, token_callback, &output);
+    printf("\n");
+
+    TEST_ASSERT(status == GGML_ENGINE_OK, "vlm audio generation status OK", "generation failed");
+    TEST_ASSERT(!output.empty(), "vlm audio output not empty", "no output generated");
+    print_info("Generated %zu chars", output.length());
+
+    auto perf = ggml_engine_get_perf(engine);
+    TEST_ASSERT(perf.prompt_tokens > 0, "vlm audio perf prompt tokens > 0", "expected > 0");
+    print_info("Prompt: %d tokens, %.1f ms (%.1f t/s)",
+        perf.prompt_tokens, perf.prompt_eval_ms, perf.prompt_tokens_per_sec);
+    print_info("Generation: %d tokens, %.1f ms (%.1f t/s)",
+        perf.generated_tokens, perf.generation_ms, perf.generation_tokens_per_sec);
+
+    ggml_engine_vlm_free(vlm);
+    ggml_engine_free(engine);
+}
+
 // ---- Test: VLM Error Cases ----
 static void test_vlm_errors(const char * model_path) {
     print_header("VLM Error Cases");
@@ -528,6 +604,8 @@ static void test_vlm_errors(const char * model_path) {
 
     // is_loaded on null
     TEST_ASSERT(!ggml_engine_vlm_is_loaded(nullptr), "vlm: null is not loaded", "should be false");
+    TEST_ASSERT(ggml_engine_vlm_encode_audio(nullptr, nullptr) == -1, "vlm: null audio encode returns -1", "wrong error code");
+    TEST_ASSERT(ggml_engine_vlm_audio_bitrate(nullptr) == -1, "vlm: null audio bitrate == -1", "wrong bitrate");
 
     ggml_engine_free(engine);
 }
@@ -791,6 +869,7 @@ static void print_usage(const char * prog) {
     printf("  -m <path>        Path to GGUF model file (required for model tests)\n");
     printf("  --mmproj <path>  Path to mmproj GGUF file (required for VLM tests)\n");
     printf("  --image <path>   Path to test image file (required for VLM encode/gen)\n");
+    printf("  --audio <path>   Path to test audio file (optional for VLM audio encode/gen)\n");
     printf("  --embed-model <path>  Path to embedding model GGUF (for RAG tests)\n");
     printf("  --rag-text <path>    Path to text file for RAG large file test\n");
     printf("  --all            Run all tests (default)\n");
@@ -803,6 +882,7 @@ int main(int argc, char ** argv) {
     const char * model_path = nullptr;
     const char * mmproj_path = nullptr;
     const char * image_path = nullptr;
+    const char * audio_path = nullptr;
     const char * embed_model_path = nullptr;
     const char * rag_text_path = nullptr;
     bool run_model_tests = true;
@@ -815,6 +895,8 @@ int main(int argc, char ** argv) {
             mmproj_path = argv[++i];
         } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
             image_path = argv[++i];
+        } else if (strcmp(argv[i], "--audio") == 0 && i + 1 < argc) {
+            audio_path = argv[++i];
         } else if (strcmp(argv[i], "--embed-model") == 0 && i + 1 < argc) {
             embed_model_path = argv[++i];
         } else if (strcmp(argv[i], "--rag-text") == 0 && i + 1 < argc) {
@@ -864,6 +946,13 @@ int main(int argc, char ** argv) {
                 test_vlm_generation(model_path, mmproj_path, image_path);
             } else {
                 print_info("Skipping VLM encode/generation tests (no --image provided)");
+            }
+
+            if (audio_path) {
+                test_vlm_audio_encode(model_path, mmproj_path, audio_path);
+                test_vlm_audio_generation(model_path, mmproj_path, audio_path);
+            } else {
+                print_info("Skipping VLM audio tests (no --audio provided)");
             }
         } else {
             // still run error case tests (only needs text model)
