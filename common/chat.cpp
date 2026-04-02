@@ -2944,6 +2944,7 @@ static void system_message_not_supported(json & messages) {
     }
 }
 
+
 static void func_args_not_string(json & messages) {
     GGML_ASSERT(messages.is_array());
     for (auto & message : messages) {
@@ -3049,6 +3050,12 @@ static common_chat_params common_chat_templates_apply_jinja(
         workaround::system_message_not_supported(params.messages);
     }
 
+    // Gemma4 tool-response workaround call sits above as a helper but we
+    // skip wiring it into params here — basic inference doesn't need the
+    // tool_responses conversion, and the helpers it depends on
+    // (common_chat_template_direct_apply, calculate_diff_split) come from
+    // files we don't ship in this fork. The helper remains available for
+    // any future wire-up.
     params.extra_context = json::object();
     for (auto el : inputs.chat_template_kwargs) {
         params.extra_context[el.first] = json::parse(el.second);
