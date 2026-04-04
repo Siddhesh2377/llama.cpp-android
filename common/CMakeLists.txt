@@ -44,9 +44,6 @@ endif()
 set(TARGET common)
 
 add_library(${TARGET} STATIC
-    arg.cpp
-    arg.h
-    base64.hpp
     chat-parser.cpp
     chat-parser.h
     chat-parser-xml-toolcall.h
@@ -57,35 +54,18 @@ add_library(${TARGET} STATIC
     chat.h
     common.cpp
     common.h
-    console.cpp
-    console.h
-    debug.cpp
-    debug.h
-    download.cpp
-    download.h
-    http.h
     json-partial.cpp
     json-partial.h
     json-schema-to-grammar.cpp
     llguidance.cpp
     log.cpp
     log.h
-    ngram-cache.cpp
-    ngram-cache.h
-    ngram-map.cpp
-    ngram-map.h
-    ngram-mod.cpp
-    ngram-mod.h
     peg-parser.cpp
     peg-parser.h
-    preset.cpp
-    preset.h
     regex-partial.cpp
     regex-partial.h
     sampling.cpp
     sampling.h
-    speculative.cpp
-    speculative.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
@@ -111,7 +91,6 @@ endif()
 
 target_link_libraries(${TARGET} PRIVATE
     build_info
-    cpp-httplib
 )
 
 if (LLAMA_LLGUIDANCE)

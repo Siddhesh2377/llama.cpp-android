@@ -90,7 +90,6 @@ add_subdirectory(src)
 # common utilities
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
-    add_subdirectory(vendor/cpp-httplib)
 endif()
 
 # Tool-Neuron engine

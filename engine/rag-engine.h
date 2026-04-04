@@ -1,12 +1,6 @@
 #pragma once
 
-/**
- * RAG Engine - Context-preserving retrieval for Android
- *
- * Uses EmbeddingGemma-300M (Q4, ~50MB) with late chunking for
- * context-aware embeddings and binary quantization for compact storage.
- * Model-agnostic: index survives LLM swaps.
- */
+// RAG engine: late-chunking retrieval with binary-quantized embeddings
 
 #include <stdint.h>
 #include <stddef.h>

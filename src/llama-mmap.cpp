@@ -180,6 +180,23 @@ struct llama_file::impl {
 
 #ifdef __linux__
     bool init_fd() {
+#ifdef __ANDROID__
+        // Android SAF: /proc/self/fd/N can't be opened via open() due to SELinux.
+        // Extract the fd number and dup() it directly.
+        {
+            int saf_fd = -1;
+            if (sscanf(fname.c_str(), "/proc/self/fd/%d", &saf_fd) == 1 && saf_fd >= 0) {
+                fd = dup(saf_fd);
+                if (fd == -1) return false;
+                struct stat file_stats{};
+                fstat(fd, &file_stats);
+                size = file_stats.st_size;
+                alignment = file_stats.st_blksize;
+                lseek(fd, 0, SEEK_SET);
+                return true;
+            }
+        }
+#endif
         fd = open(fname.c_str(), O_RDONLY | O_DIRECT);
 
         if (fd != -1) {

@@ -164,18 +164,6 @@ enum common_params_sampling_config : uint64_t {
     COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA    = 1 << 11,
 };
 
-enum common_speculative_type {
-    COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
-    COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
-};
-
 // sampling parameters
 struct common_params_sampling {
     uint32_t seed = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampler
@@ -251,56 +239,6 @@ struct common_params_model {
     std::string hf_file     = ""; // HF file                                                // NOLINT
     std::string docker_repo = ""; // Docker repo                                            // NOLINT
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
-};
-
-struct common_ngram_mod;
-
-struct common_params_speculative {
-    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
-
-    // general-purpose speculative decoding parameters
-
-    int32_t n_max   = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min   = 0; // minimum number of draft tokens to use for speculative decoding
-    float   p_split = 0.1f; // speculative decoding split probability
-    float   p_min   = 0.75f; // minimum speculative decoding probability (greedy)
-
-    // ngram-based speculative decoding
-
-    uint16_t ngram_size_n     = 12; // ngram size for lookup
-    uint16_t ngram_size_m     = 48; // mgram size for speculative tokens
-    uint16_t ngram_min_hits   =  1; // minimum hits at ngram/mgram lookup for mgram to be proposed
-
-    std::shared_ptr<common_ngram_mod> ngram_mod;
-
-    std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
-    std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
-
-    // draft-model speculative decoding
-
-    struct common_params_model mparams_dft;
-
-    llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
-
-    llama_context_params cparams_dft; // these are the parameters for the draft llama_context
-
-    int32_t n_ctx        = 0;  // draft context size
-    int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
-
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
-
-    struct cpu_params cpuparams;
-    struct cpu_params cpuparams_batch;
-
-    std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
-
-    std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
-    std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
-
-    bool has_dft() const {
-        return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
-    }
 };
 
 struct common_params_vocoder {
@@ -404,7 +342,6 @@ struct common_params {
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
 
     struct common_params_sampling    sampling;
-    struct common_params_speculative speculative;
     struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 

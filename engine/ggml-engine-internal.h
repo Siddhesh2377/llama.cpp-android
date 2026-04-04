@@ -1,12 +1,7 @@
 #pragma once
 
-/**
- * GGMLEngine internal header - shared between ggml-engine.cpp and ggml-engine-vlm.cpp
- *
- * Contains the ggml_engine struct definition and the shared generation loop.
- */
-
 #include "ggml-engine.h"
+#include "engine-utils.h"
 #include "llama.h"
 #include "common.h"
 #include "sampling.h"
@@ -14,8 +9,6 @@
 #include <string>
 #include <vector>
 #include <atomic>
-#include <cstring>
-#include <cstdlib>
 #include <cstdio>
 
 struct ggml_engine {
@@ -24,31 +17,14 @@ struct ggml_engine {
     struct llama_context * ctx    = nullptr;
     const struct llama_vocab * vocab = nullptr;
 
-    // generation state
     std::string           response;
     std::atomic<bool>     cancelled{false};
     ggml_engine_perf      perf{};
 
-    // context tracking
     int32_t               n_past = 0;
 };
 
-// Internal helper: duplicate string with malloc
-static inline char * strdup_alloc(const std::string & s) {
-    char * p = (char *)malloc(s.size() + 1);
-    if (p) {
-        memcpy(p, s.c_str(), s.size() + 1);
-    }
-    return p;
-}
-
-/**
- * Shared generation loop: sets up sampler, runs autoregressive decode from current n_past.
- * Called by both ggml_engine_generate() (after text prompt processing)
- * and ggml_engine_vlm_generate() (after multimodal chunk processing).
- *
- * Expects engine->ctx to have logits ready at position (n_past - 1).
- */
+// Autoregressive decode loop from current n_past. Expects logits ready at (n_past - 1).
 static inline ggml_engine_status ggml_engine_generate_loop(
     ggml_engine_t * engine,
     ggml_engine_sampling sampling,
@@ -57,7 +33,6 @@ static inline ggml_engine_status ggml_engine_generate_loop(
 ) {
     const int n_ctx = llama_n_ctx(engine->ctx);
 
-    // setup sampler
     auto sparams = llama_sampler_chain_default_params();
     struct llama_sampler * smpl = llama_sampler_chain_init(sparams);
 
@@ -86,7 +61,6 @@ static inline ggml_engine_status ggml_engine_generate_loop(
         llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
     }
 
-    // generate tokens
     int64_t t_gen_start = llama_time_us();
     int n_generated = 0;
     int max_tokens = sampling.n_predict > 0 ? sampling.n_predict : n_ctx - engine->n_past;
@@ -103,12 +77,10 @@ static inline ggml_engine_status ggml_engine_generate_loop(
 
         llama_token new_token = llama_sampler_sample(smpl, engine->ctx, -1);
 
-        // check for end of generation
         if (llama_vocab_is_eog(engine->vocab, new_token)) {
             break;
         }
 
-        // convert token to text
         char buf[256];
         int n = llama_token_to_piece(engine->vocab, new_token, buf, sizeof(buf), 0, true);
         if (n < 0) {
@@ -119,7 +91,7 @@ static inline ggml_engine_status ggml_engine_generate_loop(
         engine->response += piece;
         n_generated++;
 
-        // check stop sequences — windowed search
+        // windowed stop-sequence check
         bool should_stop = false;
         for (int s = 0; s < sampling.stop_sequence_count && s < 8; s++) {
             if (!sampling.stop_sequences[s]) continue;
@@ -138,14 +110,12 @@ static inline ggml_engine_status ggml_engine_generate_loop(
 
         if (should_stop) break;
 
-        // callback
         if (callback) {
             if (!callback(piece.c_str(), user_data)) {
                 break;
             }
         }
 
-        // prepare next batch
         common_batch_clear(batch);
         common_batch_add(batch, new_token, engine->n_past, {0}, true);
 

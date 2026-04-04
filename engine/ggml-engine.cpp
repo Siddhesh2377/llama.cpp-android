@@ -1,4 +1,5 @@
 #include "ggml-engine-internal.h"
+#include "tn-log.h"
 
 #include <sstream>
 #include <thread>
@@ -9,13 +10,9 @@
 #include <sched.h>
 #endif
 
-// ----- helpers -----
-
 static int detect_optimal_threads() {
 #ifdef __ANDROID__
-    // on Android, use performance cores if available
     int n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    // heuristic: use ~75% of available cores for compute
     int n_threads = (n_cpus * 3) / 4;
     return n_threads > 0 ? n_threads : 1;
 #else
@@ -24,17 +21,15 @@ static int detect_optimal_threads() {
 #endif
 }
 
-// ----- API implementation -----
-
 ggml_engine_params ggml_engine_default_params(void) {
     ggml_engine_params p{};
-    p.n_ctx            = 0;     // model default
+    p.n_ctx            = 0;
     p.n_batch          = 512;
-    p.n_threads        = 0;     // auto
-    p.n_threads_batch  = 0;     // same as n_threads
+    p.n_threads        = 0;
+    p.n_threads_batch  = 0;
     p.use_mmap         = true;
     p.use_mlock        = false;
-    p.n_gpu_layers     = 0;     // CPU only
+    p.n_gpu_layers     = 0;
     p.rope_freq_base   = 0.0f;
     p.rope_freq_scale  = 0.0f;
     p.flash_attn       = true;
@@ -83,10 +78,8 @@ void ggml_engine_free(ggml_engine_t * engine) {
 ggml_engine_status ggml_engine_load_model(ggml_engine_t * engine, const char * path) {
     if (!engine || !path) return GGML_ENGINE_ERROR_LOAD_FAILED;
 
-    // unload existing model if any
     ggml_engine_unload_model(engine);
 
-    // model params
     auto mparams = llama_model_default_params();
     mparams.use_mmap  = engine->params.use_mmap;
     mparams.use_mlock = engine->params.use_mlock;
@@ -98,11 +91,10 @@ ggml_engine_status ggml_engine_load_model(ggml_engine_t * engine, const char * p
 
     engine->vocab = llama_model_get_vocab(engine->model);
 
-    // context params
     auto cparams = llama_context_default_params();
-    cparams.n_ctx        = engine->params.n_ctx > 0 ? engine->params.n_ctx : 0; // 0 = model default
-    cparams.n_batch      = engine->params.n_batch;
-    cparams.n_threads     = engine->params.n_threads;
+    cparams.n_ctx           = engine->params.n_ctx > 0 ? engine->params.n_ctx : 0;
+    cparams.n_batch         = engine->params.n_batch;
+    cparams.n_threads       = engine->params.n_threads;
     cparams.n_threads_batch = engine->params.n_threads_batch;
     if (engine->params.flash_attn) {
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -130,8 +122,7 @@ ggml_engine_status ggml_engine_load_model(ggml_engine_t * engine, const char * p
 ggml_engine_status ggml_engine_load_model_from_fd(ggml_engine_t * engine, int fd) {
     if (!engine || fd < 0) return GGML_ENGINE_ERROR_LOAD_FAILED;
 
-    // Create a path string from the fd for Android SAF support
-    // On Android, /proc/self/fd/<fd> gives us access to the file
+    // Android SAF: access file via /proc/self/fd/<fd>
     char fd_path[64];
     snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
 
@@ -182,13 +173,11 @@ char * ggml_engine_model_info_json(const ggml_engine_t * engine) {
     json << "  \"has_decoder\": " << (llama_model_has_decoder(model) ? "true" : "false") << ",\n";
     json << "  \"is_recurrent\": " << (llama_model_is_recurrent(model) ? "true" : "false") << ",\n";
 
-    // context info if loaded
     if (engine->ctx) {
         json << "  \"n_ctx\": " << llama_n_ctx(engine->ctx) << ",\n";
         json << "  \"n_batch\": " << llama_n_batch(engine->ctx) << ",\n";
     }
 
-    // model metadata
     json << "  \"metadata\": {\n";
     int n_meta = llama_model_meta_count(model);
     for (int i = 0; i < n_meta; i++) {
@@ -197,7 +186,6 @@ char * ggml_engine_model_info_json(const ggml_engine_t * engine) {
         llama_model_meta_key_by_index(model, i, key, sizeof(key));
         llama_model_meta_val_str_by_index(model, i, val, sizeof(val));
 
-        // escape quotes in val
         std::string escaped_val;
         for (const char * p = val; *p; p++) {
             if (*p == '"') escaped_val += "\\\"";
@@ -220,12 +208,13 @@ void ggml_engine_free_string(char * str) {
     free(str);
 }
 
-ggml_engine_status ggml_engine_generate(
+static ggml_engine_status ggml_engine_generate_impl(
     ggml_engine_t * engine,
     const char * prompt,
     ggml_engine_sampling sampling,
     ggml_engine_token_callback callback,
-    void * user_data
+    void * user_data,
+    bool clear_kv
 ) {
     if (!engine || !engine->model || !engine->ctx) {
         return GGML_ENGINE_ERROR_NO_MODEL;
@@ -237,7 +226,6 @@ ggml_engine_status ggml_engine_generate(
 
     const int n_ctx = llama_n_ctx(engine->ctx);
 
-    // tokenize the prompt
     std::vector<llama_token> tokens = common_tokenize(engine->vocab, prompt, true, true);
     int n_prompt = (int)tokens.size();
 
@@ -245,26 +233,26 @@ ggml_engine_status ggml_engine_generate(
         return GGML_ENGINE_ERROR_TOKENIZE;
     }
 
-    // check if prompt fits
-    if (n_prompt + sampling.n_predict > n_ctx) {
-        if (n_prompt > n_ctx) {
-            return GGML_ENGINE_ERROR_OUT_OF_MEM;
+    if (clear_kv) {
+        llama_memory_t mem = llama_get_memory(engine->ctx);
+        if (mem) {
+            llama_memory_clear(mem, true);
         }
-        if (sampling.n_predict < 0) {
-            sampling.n_predict = n_ctx - n_prompt;
-        } else {
-            sampling.n_predict = std::min(sampling.n_predict, n_ctx - n_prompt);
-        }
+        engine->n_past = 0;
     }
 
-    // clear KV cache for fresh generation
-    llama_memory_t mem = llama_get_memory(engine->ctx);
-    if (mem) {
-        llama_memory_clear(mem, true);
+    int remaining = n_ctx - engine->n_past;
+    if (n_prompt > remaining) {
+        return GGML_ENGINE_ERROR_OUT_OF_MEM;
     }
-    engine->n_past = 0;
 
-    // process prompt in batches
+    int space_after_prompt = remaining - n_prompt;
+    if (sampling.n_predict < 0) {
+        sampling.n_predict = space_after_prompt;
+    } else {
+        sampling.n_predict = std::min(sampling.n_predict, space_after_prompt);
+    }
+
     int64_t t_prompt_start = llama_time_us();
 
     struct llama_batch batch = llama_batch_init(engine->params.n_batch, 0, 1);
@@ -290,8 +278,27 @@ ggml_engine_status ggml_engine_generate(
     engine->perf.prompt_eval_ms = (t_prompt_end - t_prompt_start) / 1000.0;
     engine->perf.prompt_tokens = n_prompt;
 
-    // shared generation loop handles sampling + autoregressive decoding
     return ggml_engine_generate_loop(engine, sampling, callback, user_data);
+}
+
+ggml_engine_status ggml_engine_generate(
+    ggml_engine_t * engine,
+    const char * prompt,
+    ggml_engine_sampling sampling,
+    ggml_engine_token_callback callback,
+    void * user_data
+) {
+    return ggml_engine_generate_impl(engine, prompt, sampling, callback, user_data, true);
+}
+
+ggml_engine_status ggml_engine_generate_continue(
+    ggml_engine_t * engine,
+    const char * prompt,
+    ggml_engine_sampling sampling,
+    ggml_engine_token_callback callback,
+    void * user_data
+) {
+    return ggml_engine_generate_impl(engine, prompt, sampling, callback, user_data, false);
 }
 
 void ggml_engine_cancel(ggml_engine_t * engine) {
@@ -326,6 +333,33 @@ int32_t ggml_engine_context_size(const ggml_engine_t * engine) {
     return llama_n_ctx(engine->ctx);
 }
 
+int32_t ggml_engine_context_remaining(const ggml_engine_t * engine) {
+    if (!engine || !engine->ctx) return 0;
+    return llama_n_ctx(engine->ctx) - engine->n_past;
+}
+
+ggml_engine_context_info ggml_engine_context_status(const ggml_engine_t * engine,
+                                                     const char * prompt) {
+    ggml_engine_context_info info = {};
+    if (!engine || !engine->ctx) return info;
+
+    info.total     = llama_n_ctx(engine->ctx);
+    info.used      = engine->n_past;
+    info.remaining = info.total - info.used;
+
+    if (prompt && engine->vocab) {
+        std::vector<llama_token> tokens = common_tokenize(engine->vocab, prompt, true, true);
+        info.prompt_estimate = (int32_t)tokens.size();
+        info.after_prompt    = info.remaining - info.prompt_estimate;
+        if (info.after_prompt < 0) info.after_prompt = 0;
+    } else {
+        info.prompt_estimate = -1;
+        info.after_prompt    = -1;
+    }
+
+    return info;
+}
+
 int32_t ggml_engine_tokenize(const ggml_engine_t * engine,
                               const char * text, int32_t * tokens, int32_t max_tokens) {
     if (!engine || !engine->vocab || !text || !tokens) return -1;
@@ -354,9 +388,171 @@ char * ggml_engine_detokenize(const ggml_engine_t * engine,
     return strdup_alloc(result);
 }
 
+ggml_engine_vectors * ggml_engine_calc_vectors(
+    ggml_engine_t * engine,
+    const char * prompt,
+    ggml_engine_progress_cb progress,
+    void * user_data
+) {
+    if (!engine || !engine->model || !prompt) return nullptr;
+
+    if (progress) progress(0.05f, user_data);
+
+    // Temporary embedding context, does not touch main KV cache
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx           = engine->params.n_ctx > 0 ? engine->params.n_ctx : 2048;
+    cparams.n_batch         = engine->params.n_batch;
+    cparams.n_threads       = engine->params.n_threads;
+    cparams.n_threads_batch = engine->params.n_threads_batch;
+    cparams.embeddings      = true;
+    cparams.pooling_type    = LLAMA_POOLING_TYPE_MEAN;
+
+    struct llama_context * emb_ctx = llama_init_from_model(engine->model, cparams);
+    if (!emb_ctx) return nullptr;
+
+    if (progress) progress(0.10f, user_data);
+
+    std::vector<llama_token> tokens = common_tokenize(engine->vocab, prompt, true, true);
+    int n_tokens = (int)tokens.size();
+    if (n_tokens < 1) {
+        llama_free(emb_ctx);
+        return nullptr;
+    }
+
+    int n_ctx = llama_n_ctx(emb_ctx);
+    if (n_tokens > n_ctx) {
+        n_tokens = n_ctx;
+        tokens.resize(n_tokens);
+    }
+
+    if (progress) progress(0.15f, user_data);
+
+    struct llama_batch batch = llama_batch_init(engine->params.n_batch, 0, 1);
+    int n_past = 0;
+
+    for (int i = 0; i < n_tokens; i += engine->params.n_batch) {
+        int n_eval = std::min(engine->params.n_batch, n_tokens - i);
+
+        common_batch_clear(batch);
+        for (int j = 0; j < n_eval; j++) {
+            common_batch_add(batch, tokens[i + j], n_past + j, {0}, true);
+        }
+
+        if (llama_decode(emb_ctx, batch) != 0) {
+            llama_batch_free(batch);
+            llama_free(emb_ctx);
+            return nullptr;
+        }
+        n_past += n_eval;
+
+        float p = 0.15f + 0.70f * ((float)(i + n_eval) / n_tokens);
+        if (progress) progress(p, user_data);
+    }
+
+    llama_batch_free(batch);
+
+    int n_embd = llama_model_n_embd(engine->model);
+    const float * embd = llama_get_embeddings_seq(emb_ctx, 0);
+
+    // Fallback to last token if pooling didn't produce output
+    if (!embd) {
+        embd = llama_get_embeddings_ith(emb_ctx, -1);
+    }
+
+    if (!embd) {
+        llama_free(emb_ctx);
+        return nullptr;
+    }
+
+    if (progress) progress(0.90f, user_data);
+
+    auto * result = (ggml_engine_vectors *)malloc(sizeof(ggml_engine_vectors));
+    if (!result) {
+        llama_free(emb_ctx);
+        return nullptr;
+    }
+
+    result->n_embd   = n_embd;
+    result->n_tokens  = n_tokens;
+    result->data      = (float *)malloc(n_embd * sizeof(float));
+    if (!result->data) {
+        free(result);
+        llama_free(emb_ctx);
+        return nullptr;
+    }
+    memcpy(result->data, embd, n_embd * sizeof(float));
+
+    llama_free(emb_ctx);
+
+    if (progress) progress(1.0f, user_data);
+    return result;
+}
+
+void ggml_engine_free_vectors(ggml_engine_vectors * v) {
+    if (!v) return;
+    free(v->data);
+    free(v);
+}
+
+bool ggml_engine_apply_vectors(
+    ggml_engine_t * engine,
+    const ggml_engine_vectors * vectors,
+    float strength,
+    int32_t il_start,
+    int32_t il_end
+) {
+    if (!engine || !engine->ctx || !engine->model || !vectors || !vectors->data) return false;
+
+    int n_embd  = llama_model_n_embd(engine->model);
+    int n_layer = llama_model_n_layer(engine->model);
+
+    if (vectors->n_embd != n_embd) return false;
+
+    if (il_start < 0) il_start = 0;
+    if (il_end   < 0) il_end   = n_layer - 1;
+    if (il_end >= n_layer) il_end = n_layer - 1;
+    if (il_start > il_end) return false;
+
+    int n_apply = il_end - il_start + 1;
+
+    // Replicate vector across target layers, scaled by strength
+    std::vector<float> cv_data(n_apply * n_embd);
+    for (int l = 0; l < n_apply; l++) {
+        for (int i = 0; i < n_embd; i++) {
+            cv_data[l * n_embd + i] = vectors->data[i] * strength;
+        }
+    }
+
+    int32_t rc = llama_set_adapter_cvec(
+        engine->ctx,
+        cv_data.data(),
+        cv_data.size(),
+        n_embd,
+        il_start,
+        il_end
+    );
+
+    return rc == 0;
+}
+
+void ggml_engine_clear_vectors(ggml_engine_t * engine) {
+    if (!engine || !engine->ctx) return;
+
+    int n_layer = llama_model_n_layer(engine->model);
+    llama_set_adapter_cvec(engine->ctx, nullptr, 0, 0, 0, n_layer - 1);
+}
+
 ggml_engine_perf ggml_engine_get_perf(const ggml_engine_t * engine) {
     if (!engine) {
         return {};
     }
     return engine->perf;
+}
+
+void tn_engine_set_log_callback(tn_engine_log_callback cb, void * user_data) {
+    tn_log_set_callback(reinterpret_cast<tn_log_callback>(cb), user_data);
+}
+
+void tn_engine_set_log_level(tn_engine_log_level max_level) {
+    tn_log_set_level(static_cast<tn_log_level>(max_level));
 }

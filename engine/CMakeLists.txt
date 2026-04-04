@@ -2,7 +2,6 @@ if(TARGET tn-engine)
     return()
 endif()
 
-# VLM (Vision Language Model) sources
 set(VLM_SOURCES
     vlm/clip.cpp
     vlm/mtmd.cpp
@@ -29,11 +28,11 @@ set(VLM_SOURCES
 )
 
 set(ENGINE_SOURCES
+    tn-log.cpp
     ggml-engine.cpp
     ggml-engine-vlm.cpp
     rag-engine.cpp
     tool-manager.cpp
-    character-engine.cpp
     ${VLM_SOURCES}
 )
 
@@ -51,11 +50,4 @@ target_include_directories(tn-engine PUBLIC
 target_link_libraries(tn-engine PUBLIC llama common ggml)
 target_compile_features(tn-engine PRIVATE cxx_std_17)
 
-# Suppress warnings from stb_image and miniaudio vendored code
 target_compile_options(tn-engine PRIVATE -Wno-cast-qual)
-
-# Test CLI
-add_executable(llama-test-cli llama-test-cli.cpp)
-target_link_libraries(llama-test-cli PRIVATE tn-engine llama common)
-target_compile_features(llama-test-cli PRIVATE cxx_std_17)
-install(TARGETS llama-test-cli RUNTIME)

@@ -579,6 +579,23 @@ static wchar_t * ggml_mbstowcs(const char * mbs) {
 #endif
 
 FILE * ggml_fopen(const char * fname, const char * mode) {
+#ifdef __ANDROID__
+    // Android SAF: /proc/self/fd/N symlinks can't be fopen'd because
+    // SELinux blocks following the symlink to the underlying storage path.
+    // Extract the fd number and use fdopen() which operates on the fd directly.
+    {
+        int fd = -1;
+        if (sscanf(fname, "/proc/self/fd/%d", &fd) == 1 && fd >= 0) {
+            int dup_fd = dup(fd);
+            if (dup_fd >= 0) {
+                FILE * f = fdopen(dup_fd, mode);
+                if (f) return f;
+                close(dup_fd);
+            }
+            return NULL;
+        }
+    }
+#endif
 #ifdef _WIN32
     FILE * file = NULL;
 

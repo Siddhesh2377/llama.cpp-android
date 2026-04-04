@@ -31,7 +31,16 @@ all this should be a public api so i can control via JNI
 ## Step 5 
 Make a LLAMA-Test-CLI executable for android devices, and run every single feature i asked here to
 
-## once this is done 
+## Context Window Tracking (Public API — expose via JNI to Kotlin)
+Three metrics must be queryable at any time:
+1. **Total context window size** — the model's n_ctx (max tokens the KV cache can hold)
+2. **Filled context** — how many tokens are currently consumed in the KV cache
+3. **Remaining context** — total minus filled
+4. **Prompt fill estimate** — given the current pending prompt (before decode), estimate how many tokens it will consume and how much will remain after
+
+All four values must be public C API functions so they can be pulled from Kotlin via JNI.
+
+## once this is done
 One all this is done and u feel that backend is ready for production after relenteless testings and improvemnt 
 make edits in /home/home/AndroidStudioProjects/AiSystems/gguf_lib 
 implement properly optimized JNI and Kotlin, just like a flexible SDK with all the features

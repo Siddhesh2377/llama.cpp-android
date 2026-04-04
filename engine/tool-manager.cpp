@@ -14,7 +14,6 @@ struct tool_entry {
 
 struct tool_manager {
     std::vector<tool_entry>  tools;
-    // O(1) tool lookup by name (index into tools vector)
     std::unordered_map<std::string, size_t> tool_index;
     tool_execute_callback    callback  = nullptr;
     void                   * user_data = nullptr;
@@ -45,7 +44,6 @@ void tool_manager_register(tool_manager_t * tm, const tool_def * tool) {
     }
     size_t idx = tm->tools.size();
     tm->tools.push_back(std::move(entry));
-    // build O(1) index for lookup during parse (use tools[idx] since entry was moved)
     if (!tm->tools[idx].name.empty()) {
         tm->tool_index[tm->tools[idx].name] = idx;
     }
@@ -93,7 +91,6 @@ char * tool_manager_get_prompt(const tool_manager_t * tm) {
     return strdup_alloc(prompt);
 }
 
-// Simple JSON string extraction (avoids regex for portability)
 static size_t find_matching_brace(const std::string & s, size_t start) {
     if (start >= s.size() || s[start] != '{') return std::string::npos;
     int depth = 0;
@@ -136,7 +133,6 @@ static std::string extract_json_value(const std::string & json, const std::strin
             return json.substr(pos, end - pos + 1);
         }
     } else if (json[pos] == '[') {
-        // handle array values
         int depth = 0;
         for (size_t i = pos; i < json.size(); i++) {
             if (json[i] == '[') depth++;
@@ -146,12 +142,10 @@ static std::string extract_json_value(const std::string & json, const std::strin
     return "";
 }
 
-// Validate required parameters are present in args_json
 static bool validate_params(const tool_entry & tool, const std::string & args_json) {
     for (const auto & p : tool.params) {
         if (!p.required) continue;
         if (!p.name) continue;
-        // check if the parameter name appears as a key in the JSON
         std::string key = "\"" + std::string(p.name) + "\"";
         if (args_json.find(key) == std::string::npos) {
             return false;
@@ -160,7 +154,7 @@ static bool validate_params(const tool_entry & tool, const std::string & args_js
     return true;
 }
 
-// try to parse a single JSON tool call from a JSON object string
+// Try multiple key names for tool name and arguments
 static bool parse_single_json_call(const std::string & obj,
                                     std::string & tool_name,
                                     std::string & args_json) {
@@ -179,7 +173,6 @@ static bool parse_single_json_call(const std::string & obj,
     return true;
 }
 
-// find ALL JSON tool calls in the output (supports multiple tool calls per response)
 static std::vector<std::pair<std::string, std::string>> find_all_json_tool_calls(
     const std::string & output) {
 
@@ -202,7 +195,6 @@ static std::vector<std::pair<std::string, std::string>> find_all_json_tool_calls
     return calls;
 }
 
-// find all XML-style tool calls: <tool_call>...</tool_call>
 static std::vector<std::pair<std::string, std::string>> find_all_xml_tool_calls(
     const std::string & output) {
 
@@ -224,7 +216,7 @@ static std::vector<std::pair<std::string, std::string>> find_all_xml_tool_calls(
     return calls;
 }
 
-// find function-call style: function_name(args) — only for registered tool names
+// Match registered tool names followed by parenthesized arguments
 static std::vector<std::pair<std::string, std::string>> find_all_function_calls(
     const std::string & output,
     const std::vector<tool_entry> & tools) {
@@ -257,7 +249,7 @@ static std::vector<std::pair<std::string, std::string>> find_all_function_calls(
     return calls;
 }
 
-// parse output for the first valid tool call (backward compatible)
+// Parse first valid tool call from model output
 tool_call_result tool_manager_parse_output(const tool_manager_t * tm, const char * model_output) {
     tool_call_result result = {};
     result.is_valid = false;
@@ -266,18 +258,16 @@ tool_call_result tool_manager_parse_output(const tool_manager_t * tm, const char
 
     std::string output(model_output);
 
-    // try strategies in order: JSON > XML > function-call
+    // Try strategies: JSON > XML > function-call
     auto calls = find_all_json_tool_calls(output);
     if (calls.empty()) calls = find_all_xml_tool_calls(output);
     if (calls.empty()) calls = find_all_function_calls(output, tm->tools);
 
     for (auto & [name, args] : calls) {
-        // O(1) tool existence check via hash map
         auto it = tm->tool_index.find(name);
         if (it == tm->tool_index.end()) continue;
 
         const tool_entry & tool = tm->tools[it->second];
-        // validate required params are present
         if (!validate_params(tool, args)) continue;
 
         result.tool_name = strdup_alloc(name);
@@ -289,7 +279,7 @@ tool_call_result tool_manager_parse_output(const tool_manager_t * tm, const char
     return result;
 }
 
-// parse output for ALL valid tool calls (multiple tools per response)
+// Parse ALL valid tool calls from model output
 tool_call_result * tool_manager_parse_output_all(const tool_manager_t * tm,
                                                   const char * model_output,
                                                   int32_t * n_calls) {
@@ -302,7 +292,6 @@ tool_call_result * tool_manager_parse_output_all(const tool_manager_t * tm,
     if (calls.empty()) calls = find_all_xml_tool_calls(output);
     if (calls.empty()) calls = find_all_function_calls(output, tm->tools);
 
-    // filter to valid, registered tools with correct params
     std::vector<std::pair<std::string, std::string>> valid;
     for (auto & [name, args] : calls) {
         auto it = tm->tool_index.find(name);

@@ -8,17 +8,15 @@
 
 struct ggml_engine_vlm {
     mtmd_context       * mtmd_ctx = nullptr;
-    ggml_engine_t      * engine   = nullptr;  // non-owning back-reference
+    ggml_engine_t      * engine   = nullptr;
     ggml_engine_vlm_params params;
 };
 
-// ----- VLM API implementation -----
-
 ggml_engine_vlm_params ggml_engine_vlm_default_params(void) {
     ggml_engine_vlm_params p{};
-    p.n_threads        = 0;   // same as engine
-    p.image_min_tokens = -1;  // model default
-    p.image_max_tokens = -1;  // model default
+    p.n_threads        = 0;
+    p.image_min_tokens = -1;
+    p.image_max_tokens = -1;
     return p;
 }
 
@@ -29,7 +27,7 @@ ggml_engine_vlm_t * ggml_engine_vlm_load(
     if (!engine || !engine->model || !mmproj_path) return nullptr;
 
     auto mtmd_params = mtmd_context_params_default();
-    mtmd_params.use_gpu = false;  // CPU only
+    mtmd_params.use_gpu = false;
     mtmd_params.n_threads = params.n_threads > 0 ? params.n_threads : engine->params.n_threads_batch;
     mtmd_params.print_timings = false;
     mtmd_params.warmup = true;
@@ -98,15 +96,12 @@ ggml_engine_status ggml_engine_vlm_generate(
     engine->response.clear();
     memset(&engine->perf, 0, sizeof(engine->perf));
 
-    // create bitmaps from images
     std::vector<mtmd_bitmap *> bitmaps;
     for (int32_t i = 0; i < n_images; i++) {
         mtmd_bitmap * bmp = nullptr;
         if (images[i].width == 0 || images[i].height == 0) {
-            // file mode: auto-detect format from bytes
             bmp = mtmd_helper_bitmap_init_from_buf(vlm->mtmd_ctx, images[i].data, images[i].size);
         } else {
-            // raw RGB mode
             bmp = mtmd_bitmap_init(images[i].width, images[i].height, images[i].data);
         }
         if (!bmp) {
@@ -116,10 +111,8 @@ ggml_engine_status ggml_engine_vlm_generate(
         bitmaps.push_back(bmp);
     }
 
-    // build const pointer array for mtmd_tokenize
     std::vector<const mtmd_bitmap *> bitmap_ptrs(bitmaps.begin(), bitmaps.end());
 
-    // tokenize prompt + images into chunks
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     mtmd_input_text input_text;
     input_text.text = prompt;
@@ -129,7 +122,6 @@ ggml_engine_status ggml_engine_vlm_generate(
     int32_t tok_result = mtmd_tokenize(vlm->mtmd_ctx, chunks,
         &input_text, bitmap_ptrs.data(), bitmap_ptrs.size());
 
-    // free bitmaps - tokenize has processed them
     for (auto * b : bitmaps) mtmd_bitmap_free(b);
 
     if (tok_result != 0) {
@@ -137,23 +129,20 @@ ggml_engine_status ggml_engine_vlm_generate(
         return GGML_ENGINE_ERROR_TOKENIZE;
     }
 
-    // clear KV cache
     llama_memory_t mem = llama_get_memory(engine->ctx);
     if (mem) {
         llama_memory_clear(mem, true);
     }
     engine->n_past = 0;
 
-    // process all chunks: text decoding + image encoding + embedding injection
     int64_t t_prompt_start = llama_time_us();
 
     llama_pos new_n_past = 0;
     int32_t eval_result = mtmd_helper_eval_chunks(
         vlm->mtmd_ctx, engine->ctx, chunks,
-        0,      // n_past
-        0,      // seq_id
+        0, 0,
         engine->params.n_batch,
-        true,   // logits_last
+        true,
         &new_n_past);
 
     mtmd_input_chunks_free(chunks);
@@ -168,7 +157,6 @@ ggml_engine_status ggml_engine_vlm_generate(
     engine->perf.prompt_eval_ms = (t_prompt_end - t_prompt_start) / 1000.0;
     engine->perf.prompt_tokens = engine->n_past;
 
-    // shared generation loop handles sampling + autoregressive decoding
     return ggml_engine_generate_loop(engine, sampling, callback, user_data);
 }
 
@@ -177,7 +165,6 @@ int32_t ggml_engine_vlm_encode_image(
 {
     if (!vlm || !vlm->mtmd_ctx || !image) return -1;
 
-    // create bitmap
     mtmd_bitmap * bmp = nullptr;
     if (image->width == 0 || image->height == 0) {
         bmp = mtmd_helper_bitmap_init_from_buf(vlm->mtmd_ctx, image->data, image->size);
@@ -186,7 +173,7 @@ int32_t ggml_engine_vlm_encode_image(
     }
     if (!bmp) return -1;
 
-    // tokenize with a simple marker prompt to get token count
+    // tokenize with marker prompt to estimate image token count
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     mtmd_input_text input_text;
     const char * marker = mtmd_default_marker();
@@ -205,7 +192,6 @@ int32_t ggml_engine_vlm_encode_image(
         return -1;
     }
 
-    // count image tokens from chunks
     int32_t n_image_tokens = 0;
     size_t n_chunks = mtmd_input_chunks_size(chunks);
     for (size_t i = 0; i < n_chunks; i++) {

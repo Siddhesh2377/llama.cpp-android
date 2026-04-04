@@ -1150,7 +1150,6 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     return chunks;
 }
 
-void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
-    g_logger_state.log_callback = log_callback ? log_callback : clip_log_callback_default;
-    g_logger_state.log_callback_user_data = user_data;
+void mtmd_log_set(ggml_log_callback /*log_callback*/, void * /*user_data*/) {
+    // logging is now handled by tn-log; this function is kept for API compat
 }

@@ -11,10 +11,6 @@
 #include <algorithm>
 #include <new>
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
 static char * rag_strdup(const char * s) {
     if (!s) return nullptr;
     size_t len = strlen(s);
@@ -23,42 +19,32 @@ static char * rag_strdup(const char * s) {
     return d;
 }
 
-// ---------------------------------------------------------------------------
-// Internal structs
-// ---------------------------------------------------------------------------
-
 struct rag_chunk {
     std::string              text;
     std::string              doc_id;
     int32_t                  chunk_index;
-    std::vector<float>       embedding;     // truncated float embedding (n_dims)
-    std::vector<uint64_t>    bq_vector;     // binary-quantized (ceil(n_dims/64) uint64s)
+    std::vector<float>       embedding;
+    std::vector<uint64_t>    bq_vector;
 };
 
 struct rag_document {
     std::string              doc_id;
-    int32_t                  first_chunk;   // index into chunks vector
+    int32_t                  first_chunk;
     int32_t                  n_chunks;
 };
 
 struct rag_engine {
     rag_engine_params        params;
 
-    // Embedding model (llama.cpp)
     llama_model            * model   = nullptr;
     llama_context          * ctx     = nullptr;
     const llama_vocab      * vocab   = nullptr;
-    int32_t                  n_embd  = 0;     // model native embedding dim
+    int32_t                  n_embd  = 0;
 
-    // Index
     std::vector<rag_chunk>       chunks;
     std::vector<rag_document>    documents;
-    std::unordered_map<std::string, int32_t> doc_index; // doc_id -> documents idx
+    std::unordered_map<std::string, int32_t> doc_index;
 };
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 rag_engine_params rag_engine_default_params(void) {
     return {
@@ -98,14 +84,9 @@ int32_t rag_engine_chunk_count(const rag_engine_t * engine) {
     return engine ? (int32_t)engine->chunks.size() : 0;
 }
 
-// ---------------------------------------------------------------------------
-// Model Loading
-// ---------------------------------------------------------------------------
-
 static int32_t rag_load_model_impl(rag_engine_t * engine, llama_model * model) {
     if (!model) return -1;
 
-    // Free previous
     if (engine->ctx)   { llama_free(engine->ctx); engine->ctx = nullptr; }
     if (engine->model) { llama_model_free(engine->model); engine->model = nullptr; }
 
@@ -113,9 +94,9 @@ static int32_t rag_load_model_impl(rag_engine_t * engine, llama_model * model) {
     engine->vocab = llama_model_get_vocab(model);
     engine->n_embd = llama_model_n_embd(model);
 
-    // Create context — POOLING_TYPE_NONE gives raw per-token embeddings
+    // POOLING_TYPE_NONE for raw per-token embeddings
     auto ctx_params = llama_context_default_params();
-    ctx_params.n_ctx        = 2048;  // EmbeddingGemma context window
+    ctx_params.n_ctx        = 2048;
     ctx_params.n_batch      = 2048;
     ctx_params.n_ubatch     = 2048;
     ctx_params.n_threads    = engine->params.n_threads > 0 ? engine->params.n_threads : 4;
@@ -155,15 +136,11 @@ int32_t rag_engine_load_model_from_fd(rag_engine_t * engine, int fd) {
     return rag_load_model_impl(engine, model);
 }
 
-// ---------------------------------------------------------------------------
-// Embedding core
-// ---------------------------------------------------------------------------
-
 static std::vector<llama_token> rag_tokenize(const rag_engine_t * engine, const char * text) {
     return common_tokenize(engine->vocab, text, true, false);
 }
 
-// Encode tokens via llama_encode(), extract raw per-token embeddings [n_tokens x n_embd].
+// Encode tokens and extract raw per-token embeddings [n_tokens x n_embd]
 static std::vector<float> rag_encode_tokens(
     rag_engine_t * engine,
     const llama_token * tokens, int32_t n_tokens
@@ -175,7 +152,7 @@ static std::vector<float> rag_encode_tokens(
         batch.pos[i]      = i;
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i]   = true;  // need embeddings for all tokens
+        batch.logits[i]   = true;
     }
     batch.n_tokens = n_tokens;
 
@@ -184,7 +161,6 @@ static std::vector<float> rag_encode_tokens(
         return {};
     }
 
-    // Extract per-token embeddings
     std::vector<float> embeddings(n_tokens * engine->n_embd);
     for (int32_t i = 0; i < n_tokens; i++) {
         const float * emb = llama_get_embeddings_ith(engine->ctx, i);
@@ -199,7 +175,7 @@ static std::vector<float> rag_encode_tokens(
     return embeddings;
 }
 
-// Mean-pool token embeddings [start, end), truncate to n_dims (Matryoshka), L2-normalize.
+// Mean-pool token embeddings [start, end), truncate to n_dims (Matryoshka), L2-normalize
 static std::vector<float> rag_mean_pool_and_truncate(
     const float * token_embeddings, int32_t n_embd,
     int32_t start, int32_t end, int32_t n_dims
@@ -216,7 +192,6 @@ static std::vector<float> rag_mean_pool_and_truncate(
         }
     }
 
-    // Mean
     float inv = 1.0f / (float)count;
     for (int32_t d = 0; d < dims; d++) {
         result[d] *= inv;
@@ -238,7 +213,7 @@ static std::vector<float> rag_mean_pool_and_truncate(
     return result;
 }
 
-// Embed a short text (query). For full documents, use late chunking path.
+// Embed a short text (query)
 static std::vector<float> rag_embed_text(rag_engine_t * engine, const char * text) {
     auto tokens = rag_tokenize(engine, text);
     if (tokens.empty()) return {};
@@ -251,10 +226,6 @@ static std::vector<float> rag_embed_text(rag_engine_t * engine, const char * tex
         0, (int32_t)tokens.size(), engine->params.n_dims
     );
 }
-
-// ---------------------------------------------------------------------------
-// Binary Quantization
-// ---------------------------------------------------------------------------
 
 // Float vector -> binary vector (threshold at 0)
 static std::vector<uint64_t> rag_bq_quantize(const float * vec, int32_t n_dims) {
@@ -269,7 +240,6 @@ static std::vector<uint64_t> rag_bq_quantize(const float * vec, int32_t n_dims) 
     return bq;
 }
 
-// Hamming distance = popcount(XOR)
 static int32_t rag_hamming_distance(
     const uint64_t * a, const uint64_t * b, int32_t n_words
 ) {
@@ -280,7 +250,7 @@ static int32_t rag_hamming_distance(
     return dist;
 }
 
-// Cosine similarity (dot product for L2-normalized vectors)
+// Dot product of L2-normalized vectors = cosine similarity
 static float rag_cosine_similarity(const float * a, const float * b, int32_t n_dims) {
     float dot = 0.0f;
     for (int32_t i = 0; i < n_dims; i++) {
@@ -289,14 +259,14 @@ static float rag_cosine_similarity(const float * a, const float * b, int32_t n_d
     return dot;
 }
 
-// BQ search: find top_k candidates by Hamming distance
+// BQ coarse search: top_k candidates by Hamming distance
 static std::vector<std::pair<int32_t, int32_t>> rag_bq_search(
     const std::vector<uint64_t> & query_bq,
     const std::vector<rag_chunk> & chunks,
     int32_t top_k
 ) {
     int32_t n_words = (int32_t)query_bq.size();
-    std::vector<std::pair<int32_t, int32_t>> distances; // (distance, index)
+    std::vector<std::pair<int32_t, int32_t>> distances;
     distances.reserve(chunks.size());
 
     for (int32_t i = 0; i < (int32_t)chunks.size(); i++) {
@@ -311,12 +281,7 @@ static std::vector<std::pair<int32_t, int32_t>> rag_bq_search(
     return distances;
 }
 
-// ---------------------------------------------------------------------------
-// Document Indexing
-// ---------------------------------------------------------------------------
-
-// Late chunking: encode full document (sliding windows for long docs),
-// then chunk the token embeddings so each chunk vector has full-doc context.
+// Late chunking: encode full document with sliding windows, then chunk token embeddings
 static int32_t rag_index_document_late(
     rag_engine_t * engine, const char * text, const char * doc_id
 ) {
@@ -327,7 +292,6 @@ static int32_t rag_index_document_late(
     int32_t ctx_window = 2048;
     int32_t window_overlap = 256;
 
-    // Accumulate token embeddings across sliding windows
     std::vector<float> all_embs(n_tokens * engine->n_embd, 0.0f);
     std::vector<int32_t> emb_counts(n_tokens, 0);
 
@@ -349,7 +313,7 @@ static int32_t rag_index_document_late(
         if (end >= n_tokens) break;
     }
 
-    // Average overlapping regions
+    // Average overlapping window regions
     for (int32_t i = 0; i < n_tokens; i++) {
         if (emb_counts[i] > 1) {
             float inv = 1.0f / (float)emb_counts[i];
@@ -359,7 +323,6 @@ static int32_t rag_index_document_late(
         }
     }
 
-    // Chunk the token embeddings
     int32_t chunk_size    = engine->params.chunk_size;
     int32_t chunk_overlap = engine->params.chunk_overlap;
     int32_t first_chunk   = (int32_t)engine->chunks.size();
@@ -374,7 +337,6 @@ static int32_t rag_index_document_late(
         );
         auto bq = rag_bq_quantize(embedding.data(), engine->params.n_dims);
 
-        // Detokenize chunk text
         std::string chunk_text;
         for (int32_t t = tok_start; t < tok_end; t++) {
             chunk_text += common_token_to_piece(engine->ctx, tokens[t]);
@@ -404,7 +366,7 @@ static int32_t rag_index_document_late(
     return n_chunks;
 }
 
-// Naive fallback: chunk first, then embed each chunk independently.
+// Naive fallback: chunk first, embed each chunk independently
 static int32_t rag_index_document_naive(
     rag_engine_t * engine, const char * text, const char * doc_id
 ) {
@@ -465,7 +427,6 @@ int32_t rag_engine_add_document(rag_engine_t * engine,
     if (!engine || !text || !doc_id) return -1;
     if (!rag_engine_is_loaded(engine)) return -1;
 
-    // Remove existing document with same ID
     if (engine->doc_index.count(doc_id)) {
         rag_engine_remove_document(engine, doc_id);
     }
@@ -486,13 +447,11 @@ int32_t rag_engine_remove_document(rag_engine_t * engine, const char * doc_id) {
     int32_t doc_idx = it->second;
     const auto & doc = engine->documents[doc_idx];
 
-    // Remove chunks belonging to this document
     engine->chunks.erase(
         engine->chunks.begin() + doc.first_chunk,
         engine->chunks.begin() + doc.first_chunk + doc.n_chunks
     );
 
-    // Shift first_chunk for documents that came after
     for (auto & d : engine->documents) {
         if (d.first_chunk > doc.first_chunk) {
             d.first_chunk -= doc.n_chunks;
@@ -502,7 +461,7 @@ int32_t rag_engine_remove_document(rag_engine_t * engine, const char * doc_id) {
     engine->documents.erase(engine->documents.begin() + doc_idx);
     engine->doc_index.erase(it);
 
-    // Rebuild doc_index
+    // Rebuild doc_index after erasure
     engine->doc_index.clear();
     for (int32_t i = 0; i < (int32_t)engine->documents.size(); i++) {
         engine->doc_index[engine->documents[i].doc_id] = i;
@@ -518,10 +477,6 @@ void rag_engine_clear(rag_engine_t * engine) {
     engine->doc_index.clear();
 }
 
-// ---------------------------------------------------------------------------
-// Retrieval
-// ---------------------------------------------------------------------------
-
 rag_result * rag_engine_query(rag_engine_t * engine,
     const char * query, int32_t * n_results)
 {
@@ -529,17 +484,16 @@ rag_result * rag_engine_query(rag_engine_t * engine,
     if (!rag_engine_is_loaded(engine)) return nullptr;
     if (engine->chunks.empty()) { *n_results = 0; return nullptr; }
 
-    // 1. Embed query
     auto query_emb = rag_embed_text(engine, query);
     if (query_emb.empty()) return nullptr;
 
-    // 2. BQ search (Hamming distance) -> top_k candidates
+    // BQ coarse search -> top_k candidates
     auto query_bq = rag_bq_quantize(query_emb.data(), engine->params.n_dims);
     auto candidates = rag_bq_search(query_bq, engine->chunks, engine->params.top_k);
 
     if (candidates.empty()) { *n_results = 0; return nullptr; }
 
-    // 3. Cosine re-rank with float vectors -> top_n
+    // Cosine re-rank -> top_n
     std::vector<std::pair<float, int32_t>> scored;
     scored.reserve(candidates.size());
     for (auto & [hamming_dist, chunk_idx] : candidates) {
@@ -556,7 +510,6 @@ rag_result * rag_engine_query(rag_engine_t * engine,
 
     int32_t n = std::min(engine->params.top_n, (int32_t)scored.size());
 
-    // 4. Build results
     auto * results = (rag_result *)malloc(n * sizeof(rag_result));
     if (!results) return nullptr;
 
@@ -581,10 +534,6 @@ void rag_engine_free_results(rag_result * results, int32_t n) {
     }
     free(results);
 }
-
-// ---------------------------------------------------------------------------
-// Prompt Builder
-// ---------------------------------------------------------------------------
 
 char * rag_engine_build_prompt(rag_engine_t * engine,
     const char * query, const char * user_prompt)
@@ -613,10 +562,6 @@ char * rag_engine_build_prompt(rag_engine_t * engine,
 
     return rag_strdup(prompt.c_str());
 }
-
-// ---------------------------------------------------------------------------
-// Info
-// ---------------------------------------------------------------------------
 
 char * rag_engine_info_json(const rag_engine_t * engine) {
     if (!engine) return nullptr;

@@ -308,54 +308,14 @@ struct clip_image_f32 {
 // logging
 //
 
-static void clip_log_callback_default(enum ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
-    (void) user_data;
-    fputs(text, stderr);
-    fflush(stderr);
-}
+#include "tn-log.h"
 
-struct clip_logger_state {
-    ggml_log_callback log_callback;
-    void * log_callback_user_data;
-};
+#define LOG_INF(...) TN_LOG_INF(__VA_ARGS__)
+#define LOG_WRN(...) TN_LOG_WRN(__VA_ARGS__)
+#define LOG_ERR(...) TN_LOG_ERR(__VA_ARGS__)
+#define LOG_DBG(...) TN_LOG_DBG(__VA_ARGS__)
+#define LOG_CNT(...) TN_LOG_INF(__VA_ARGS__)
 
-extern struct clip_logger_state g_logger_state;
-
-static void clip_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
-    if (format == NULL) {
-        return;
-    }
-    va_list args_copy;
-    va_copy(args_copy, args);
-    char buffer[128];
-    int len = vsnprintf(buffer, 128, format, args);
-    if (len < 128) {
-        g_logger_state.log_callback(level, buffer, g_logger_state.log_callback_user_data);
-    } else {
-        char * buffer2 = (char *) calloc(len + 1, sizeof(char));
-        vsnprintf(buffer2, len + 1, format, args_copy);
-        buffer2[len] = 0;
-        g_logger_state.log_callback(level, buffer2, g_logger_state.log_callback_user_data);
-        free(buffer2);
-    }
-    va_end(args_copy);
-}
-
-static void clip_log_internal(enum ggml_log_level level, const char * format, ...) {
-    va_list args;
-    va_start(args, format);
-    clip_log_internal_v(level, format, args);
-    va_end(args);
-}
-
-#define LOG_INF(...) clip_log_internal(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
-#define LOG_WRN(...) clip_log_internal(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
-#define LOG_ERR(...) clip_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
-#define LOG_DBG(...) clip_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define LOG_CNT(...) clip_log_internal(GGML_LOG_LEVEL_CONT,  __VA_ARGS__)
-
-//
 // cpp wrappers
 //
 
