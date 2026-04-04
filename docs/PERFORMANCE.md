@@ -6,7 +6,7 @@ Optimizations specific to this CPU-only Android fork.
 
 ## Benchmarks
 
-Tested on **Cortex-X3** (armv9-a, i8mm, bf16, NEON, dotprod):
+Tested on Cortex-X3 (armv9-a, i8mm, bf16, NEON, dotprod):
 
 | Model | Type | Quant | Prompt Eval | Generation | Context |
 |-------|------|-------|-------------|------------|---------|
@@ -26,20 +26,20 @@ Enabled via `GGML_CPU_ARM_ARCH=armv8.6-a+i8mm+dotprod+fp16`:
 
 | Feature | Effect |
 |---------|--------|
-| **i8mm** | INT8 matrix multiply — accelerates Q4/Q8 quantized inference |
-| **dotprod** | Dot product instructions — fast Q4_0/Q8_0 kernels |
-| **fp16** | Half-precision FP — F16 compute without conversion overhead |
-| **NEON** | 128-bit SIMD — baseline vector operations |
-| **bf16** | BFloat16 — used by some compute kernels when available |
+| i8mm | INT8 matrix multiply -- accelerates Q4/Q8 quantized inference |
+| dotprod | Dot product instructions -- fast Q4_0/Q8_0 kernels |
+| fp16 | Half-precision FP -- F16 compute without conversion overhead |
+| NEON | 128-bit SIMD -- baseline vector operations |
+| bf16 | BFloat16 -- used by some compute kernels when available |
 
 ### KleidiAI Micro-Kernels
 
 ARM's optimized GEMM/GEMV kernels for quantized operations. Enabled via `GGML_CPU_KLEIDIAI=ON`.
 
 These replace the generic C implementations with hand-tuned assembly for:
-- Q4_0 × F32 matrix multiply
-- Q8_0 × F32 matrix multiply
-- Q4_K × F32 mixed-precision GEMM
+- Q4_0 x F32 matrix multiply
+- Q8_0 x F32 matrix multiply
+- Q4_K x F32 mixed-precision GEMM
 
 ---
 
@@ -51,7 +51,7 @@ These replace the generic C implementations with hand-tuned assembly for:
 n_threads_batch = all P-cores (e.g., 4 on Cortex-X3)
 ```
 
-Prompt evaluation is compute-bound — more threads = faster. Uses all available performance cores.
+Prompt evaluation is compute-bound -- more threads means faster processing. Uses all available performance cores.
 
 ### Token Generation (Memory-Bound)
 
@@ -74,9 +74,9 @@ The JNI bridge pins threads to performance cores via `sched_setaffinity`. This p
 Multi-turn conversations share a common prefix (system prompt + earlier turns). The engine detects the longest common prefix and skips re-evaluating those tokens.
 
 ```
-Turn 1:  [SYS][USER_1][ASST_1]          → eval all
-Turn 2:  [SYS][USER_1][ASST_1][USER_2]  → skip prefix, eval USER_2 only
-Turn 3:  [SYS][USER_1][ASST_1][USER_2][ASST_2][USER_3]  → skip prefix
+Turn 1:  [SYS][USER_1][ASST_1]          -> eval all
+Turn 2:  [SYS][USER_1][ASST_1][USER_2]  -> skip prefix, eval USER_2 only
+Turn 3:  [SYS][USER_1][ASST_1][USER_2][ASST_2][USER_3]  -> skip prefix
 ```
 
 Savings: typically 50-80% of prompt tokens are skipped on follow-up turns.
@@ -90,38 +90,18 @@ When the KV cache fills up (`context_used >= context_size`), the engine automati
 3. Remove middle tokens from KV cache
 4. Continue generation without interruption
 
-This allows infinite conversation length without model reload.
+This allows indefinite conversation length without model reload.
 
 ### Disk-Backed Prompt Cache
 
 System prompts are cached to disk using FNV-1a hashed filenames. On cold start with the same system prompt, the engine loads the cached KV state instead of re-evaluating.
 
 ```
-First load:   system prompt → tokenize → eval → save to disk
-Second load:  system prompt → hash match → load from disk (instant)
+First load:   system prompt -> tokenize -> eval -> save to disk
+Second load:  system prompt -> hash match -> load from disk (instant)
 ```
 
 Cache location is set via `setPromptCacheDir()` in the Kotlin SDK.
-
----
-
-## Speculative Decoding
-
-Ngram-based self-speculative decoding (no draft model required):
-
-1. **Draft**: N-gram cache predicts next K tokens based on observed patterns
-2. **Verify**: Batch-evaluate all K tokens in parallel against the model
-3. **Accept**: Tokens matching the model's distribution are accepted
-
-```
-Without speculation:  1 token per forward pass
-With speculation:     1-4 tokens per forward pass (for structured output)
-```
-
-Performance:
-- **1.3-2x speedup** for JSON, code, and repetitive text
-- **No speedup** for creative/novel text (n-gram cache misses)
-- **Zero overhead** when disabled (opt-in via `setSpeculativeDecoding()`)
 
 ---
 
@@ -170,7 +150,7 @@ EmbeddingGemma-300M Q4_0 (~265 MB), 768 native dims, 2048 context.
 | `-fvisibility=hidden` | No PLT entries for internal symbols |
 | Strip (`-s`) | Remove symbol table |
 
-Result: **~4.1 MB** stripped `.so` for arm64-v8a (down from 5.6 MB without section flags).
+Result: ~4.1 MB stripped `.so` for arm64-v8a (down from 5.6 MB without section flags).
 
 ---
 
@@ -193,14 +173,14 @@ These are implemented in the JNI bridge (`gguf_lib.cpp`), not in this repo:
 
 ### Model Memory
 
-Models are memory-mapped (`use_mmap=true` by default). The OS pages in only the weights being accessed, so a 4GB model doesn't require 4GB of free RAM.
+Models are memory-mapped (`use_mmap=true` by default). The OS pages in only the weights being accessed, so a 4 GB model does not require 4 GB of free RAM.
 
 ### KV Cache Memory
 
 Approximate KV cache size:
 
 ```
-KV bytes ≈ n_ctx × n_layer × 2 × (n_embd / n_head) × n_head_kv × sizeof(type)
+KV bytes = n_ctx * n_layer * 2 * (n_embd / n_head) * n_head_kv * sizeof(type)
 ```
 
 | Model | Context | KV Cache |

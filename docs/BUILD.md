@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repo is a C/C++ library consumed via CMake. It does **not** build standalone — it's compiled as part of an Android NDK build through the `gguf_lib` module.
+This repository is a C/C++ library consumed via CMake. It does not build standalone executables. It is compiled as part of an Android NDK build through the `gguf_lib` module.
 
 ```
 gguf_lib (Android library module)
@@ -53,25 +53,6 @@ gguf_lib (Android library module)
 
 ---
 
-## Standalone Build (Desktop Testing)
-
-For running `llama-test-cli` on a desktop Linux machine:
-
-```bash
-cmake -B build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CPU=ON \
-  -DBUILD_SHARED_LIBS=OFF \
-  -DLLAMA_BUILD_COMMON=ON
-
-cmake --build build -j$(nproc)
-
-# Run tests
-./build/bin/llama-test-cli -m /path/to/model.gguf
-```
-
----
-
 ## Android NDK Cross-Compilation
 
 ### As a CMake subdirectory (production path)
@@ -119,7 +100,7 @@ cmake -B build \
 cmake --build build -j$(nproc)
 ```
 
-Output: static libraries in `build/` (`libggml.a`, `libllama.a`, `libcommon.a`, `libtn-engine.a`).
+Output: `libggml.a`, `libllama.a`, `libcommon.a`, `libtn-engine.a` in the build tree.
 
 ---
 
@@ -163,9 +144,8 @@ These are set by the consuming `gguf_lib/CMakeLists.txt` for maximum performance
 |--------|------|-------------|
 | `ggml` | Static lib | GGML tensor library (CPU backend) |
 | `llama` | Static lib | Model loading, tokenization, inference, sampling |
-| `common` | Static lib | Chat templates, JSON schema, sampling, ngram cache |
-| `tn-engine` | Static lib | GGMLEngine, VLM Engine, ToolManager, CharacterEngine, RAG Engine |
-| `llama-test-cli` | Executable | Test suite (62+ tests) |
+| `common` | Static lib | Chat templates, JSON schema, sampling utilities |
+| `tn-engine` | Static lib | GGMLEngine, VLM Engine, ToolManager, RAG Engine |
 
 ---
 
@@ -175,7 +155,7 @@ These are set by the consuming `gguf_lib/CMakeLists.txt` for maximum performance
 |---------|------|
 | Final `libgguf_lib.so` | ~4.1 MB |
 
-The `-ffunction-sections` + `-fdata-sections` + `--gc-sections` combination strips ~27% of dead code from the final binary.
+The `-ffunction-sections` + `-fdata-sections` + `--gc-sections` combination strips approximately 27% of dead code from the final binary.
 
 ---
 
