@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=/usr/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/download-kleidiai_download-populate.cmake;COMMAND;/usr/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/verify-kleidiai_download-populate.cmake;COMMAND;/usr/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/extract-kleidiai_download-populate.cmake
+source_dir=/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-src
+work_dir=/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps
+url(s)=https://github.com/ARM-software/kleidiai/archive/refs/tags/v1.16.0.tar.gz
+hash=MD5=0a9e9008adb6031f9e8cf70dff4a3321
+      no_extract=
+

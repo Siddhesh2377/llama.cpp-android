@@ -10,6 +10,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "llama.h"
+#include "tn-log.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -36,60 +37,14 @@
 #error "mtmd-helper is a public library outside of mtmd. it must not include internal headers"
 #endif
 
-//
-// internal logging functions
-//
+// Route mtmd-helper logs through tn-log so per-stage VLM timings land in
+// Android logcat (previously they went to stderr and were invisible).
+#define LOG_INF(...) TN_LOG_INF(__VA_ARGS__)
+#define LOG_WRN(...) TN_LOG_WRN(__VA_ARGS__)
+#define LOG_ERR(...) TN_LOG_ERR(__VA_ARGS__)
 
-struct mtmd_helper_logger {
-    ggml_log_callback default_callback = [](ggml_log_level level, const char * text, void * user_data) {
-        (void) level;
-        (void) user_data;
-        fputs(text, stderr);
-        fflush(stderr);
-    };
-
-    ggml_log_callback log_callback = default_callback;
-    void * log_callback_user_data;
-
-    void log_v(enum ggml_log_level level, const char * format, va_list args) {
-        if (format == NULL) {
-            return;
-        }
-        va_list args_copy;
-        va_copy(args_copy, args);
-        char buffer[128];
-        int len = vsnprintf(buffer, 128, format, args);
-        if (len < 128) {
-            log_callback(level, buffer, log_callback_user_data);
-        } else {
-            char * buffer2 = (char *) calloc(len + 1, sizeof(char));
-            vsnprintf(buffer2, len + 1, format, args_copy);
-            buffer2[len] = 0;
-            log_callback(level, buffer2, log_callback_user_data);
-            free(buffer2);
-        }
-        va_end(args_copy);
-    }
-
-    void log(enum ggml_log_level level, const char * format, ...) {
-        va_list args;
-        va_start(args, format);
-        log_v(level, format, args);
-        va_end(args);
-    }
-} g_logger;
-
-#define LOG_INF(...) g_logger.log(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
-#define LOG_WRN(...) g_logger.log(GGML_LOG_LEVEL_WARN,  __VA_ARGS__)
-#define LOG_ERR(...) g_logger.log(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
-
-void mtmd_helper_log_set(ggml_log_callback log_callback, void * user_data) {
-    if (log_callback == nullptr) {
-        log_callback = g_logger.default_callback;
-    }
-    g_logger.log_callback = log_callback;
-    g_logger.log_callback_user_data = user_data;
-    mtmd_log_set(log_callback, user_data);
+void mtmd_helper_log_set(ggml_log_callback /*log_callback*/, void * /*user_data*/) {
+    // logging is now handled by tn-log; this function is kept for API compat
 }
 
 //

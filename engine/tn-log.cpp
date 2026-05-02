@@ -1,6 +1,7 @@
 #include "tn-log.h"
 
 #include <atomic>
+#include <mutex>
 #include <cstdarg>
 #include <cstdio>
 
@@ -8,11 +9,14 @@
 #include <android/log.h>
 #endif
 
+// Mutex guards callback + user_data pair so they are always updated together
+static std::mutex            g_log_mutex;
 static tn_log_callback       g_callback  = nullptr;
 static void *                g_user_data = nullptr;
 static std::atomic<int32_t>  g_max_level{TN_LOG_LEVEL_INFO};
 
 void tn_log_set_callback(tn_log_callback cb, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
     g_callback  = cb;
     g_user_data = user_data;
 }
@@ -32,9 +36,17 @@ void tn_log_write(enum tn_log_level level, const char * tag, const char * fmt, .
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    // Dispatch to user callback if registered
-    if (g_callback) {
-        g_callback(level, tag, buf, g_user_data);
+    // Snapshot callback + user_data under lock so they are always a matched pair
+    tn_log_callback cb;
+    void * ud;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        cb = g_callback;
+        ud = g_user_data;
+    }
+
+    if (cb) {
+        cb(level, tag, buf, ud);
         return;
     }
 

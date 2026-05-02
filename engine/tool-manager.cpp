@@ -266,12 +266,18 @@ tool_call_result tool_manager_parse_output(const tool_manager_t * tm, const char
     for (auto & [name, args] : calls) {
         auto it = tm->tool_index.find(name);
         if (it == tm->tool_index.end()) continue;
+        if (it->second >= tm->tools.size()) continue;
 
         const tool_entry & tool = tm->tools[it->second];
         if (!validate_params(tool, args)) continue;
 
         result.tool_name = strdup_alloc(name);
         result.arguments_json = strdup_alloc(args);
+        if (!result.tool_name || !result.arguments_json) {
+            free((void *)result.tool_name);
+            free((void *)result.arguments_json);
+            return result; // is_valid stays false
+        }
         result.is_valid = true;
         return result;
     }
@@ -306,8 +312,17 @@ tool_call_result * tool_manager_parse_output_all(const tool_manager_t * tm,
     if (!results) return nullptr;
 
     for (size_t i = 0; i < valid.size(); i++) {
-        results[i].tool_name = strdup_alloc(valid[i].first);
-        results[i].arguments_json = strdup_alloc(valid[i].second);
+        results[i].tool_name       = strdup_alloc(valid[i].first);
+        results[i].arguments_json  = strdup_alloc(valid[i].second);
+        if (!results[i].tool_name || !results[i].arguments_json) {
+            // partial allocation failed — free everything allocated so far
+            for (size_t j = 0; j <= i; j++) {
+                free((void *)results[j].tool_name);
+                free((void *)results[j].arguments_json);
+            }
+            free(results);
+            return nullptr;
+        }
         results[i].is_valid = true;
     }
     *n_calls = (int32_t)valid.size();

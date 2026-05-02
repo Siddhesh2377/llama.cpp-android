@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

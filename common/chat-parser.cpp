@@ -4,6 +4,7 @@
 #include "log.h"
 #include "peg-parser.h"
 #include "regex-partial.h"
+#include "universal-toolcall.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1595,7 +1596,15 @@ common_chat_msg common_chat_parse(const std::string & input, bool is_partial, co
     if (syntax.format == COMMON_CHAT_FORMAT_PEG_SIMPLE ||
         syntax.format == COMMON_CHAT_FORMAT_PEG_NATIVE ||
         syntax.format == COMMON_CHAT_FORMAT_PEG_CONSTRUCTED) {
-        return common_chat_peg_parse(syntax.parser, input, is_partial, syntax);
+        if (!syntax.parser.empty()) {
+            return common_chat_peg_parse(syntax.parser, input, is_partial, syntax);
+        }
+        LOG_DBG("common_chat_parse: PEG arena empty for %s, using universal parser\n",
+                common_chat_format_name(syntax.format));
+        common_chat_msg_parser builder(input, is_partial, syntax);
+        (void) common_universal_toolcall_parse(builder);
+        builder.add_content(builder.consume_rest());
+        return builder.result();
     }
     common_chat_msg_parser builder(input, is_partial, syntax);
     try {
@@ -1605,7 +1614,12 @@ common_chat_msg common_chat_parse(const std::string & input, bool is_partial, co
         if (!is_partial) {
             builder.clear_tools();
             builder.move_to(0);
-            common_chat_parse_content_only(builder);
+            if (!common_universal_toolcall_parse(builder)) {
+                builder.move_to(0);
+                common_chat_parse_content_only(builder);
+            } else {
+                builder.add_content(builder.consume_rest());
+            }
         }
     }
     auto msg = builder.result();

@@ -29,6 +29,7 @@ set(VLM_SOURCES
 
 set(ENGINE_SOURCES
     tn-log.cpp
+    thread-engine.cpp
     ggml-engine.cpp
     ggml-engine-vlm.cpp
     rag-engine.cpp
@@ -51,3 +52,12 @@ target_link_libraries(tn-engine PUBLIC llama common ggml)
 target_compile_features(tn-engine PRIVATE cxx_std_17)
 
 target_compile_options(tn-engine PRIVATE -Wno-cast-qual)
+
+# ── vlm-bench ────────────────────────────────────────────────────────────────
+# Standalone binary used to measure VLM per-stage timings on an Android device.
+add_executable(vlm-bench vlm-bench.cpp)
+target_link_libraries(vlm-bench PRIVATE tn-engine)
+target_compile_features(vlm-bench PRIVATE cxx_std_17)
+if(ANDROID)
+    target_link_libraries(vlm-bench PRIVATE log)
+endif()

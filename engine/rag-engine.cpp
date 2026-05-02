@@ -8,8 +8,16 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <new>
+
+// Provided by rag_ingest in the gguf_lib build. Forward-declared here to keep
+// rag-engine.cpp free of an unconditional dependency on rag_ingest sources.
+extern "C" int  rag_ingest_extract(const uint8_t * bytes, size_t len,
+                                   const char * mime_hint, const char * name_hint,
+                                   char ** out_text);
+extern "C" void rag_ingest_free_string(char * s);
 
 static char * rag_strdup(const char * s) {
     if (!s) return nullptr;
@@ -40,11 +48,26 @@ struct rag_engine {
     llama_context          * ctx     = nullptr;
     const llama_vocab      * vocab   = nullptr;
     int32_t                  n_embd  = 0;
+    std::string              model_fingerprint;
 
     std::vector<rag_chunk>       chunks;
     std::vector<rag_document>    documents;
     std::unordered_map<std::string, int32_t> doc_index;
 };
+
+static std::string rag_compute_model_fingerprint(llama_model * model, int32_t n_embd) {
+    char desc[256] = {0};
+    llama_model_desc(model, desc, sizeof(desc));
+    uint64_t size_b   = llama_model_size(model);
+    uint64_t n_params = llama_model_n_params(model);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s|n_embd=%d|size=%llu|nparams=%llu",
+        desc, (int)n_embd,
+        (unsigned long long)size_b,
+        (unsigned long long)n_params);
+    return std::string(buf);
+}
 
 rag_engine_params rag_engine_default_params(void) {
     return {
@@ -109,6 +132,8 @@ static int32_t rag_load_model_impl(rag_engine_t * engine, llama_model * model) {
         engine->model = nullptr;
         return -1;
     }
+
+    engine->model_fingerprint = rag_compute_model_fingerprint(engine->model, engine->n_embd);
 
     return 0;
 }
@@ -458,13 +483,12 @@ int32_t rag_engine_remove_document(rag_engine_t * engine, const char * doc_id) {
         }
     }
 
-    engine->documents.erase(engine->documents.begin() + doc_idx);
     engine->doc_index.erase(it);
+    engine->documents.erase(engine->documents.begin() + doc_idx);
 
-    // Rebuild doc_index after erasure
-    engine->doc_index.clear();
-    for (int32_t i = 0; i < (int32_t)engine->documents.size(); i++) {
-        engine->doc_index[engine->documents[i].doc_id] = i;
+    // Only decrement indices for documents that shifted due to the erasure
+    for (auto & [id, idx] : engine->doc_index) {
+        if (idx > (size_t)doc_idx) idx--;
     }
 
     return 0;
@@ -477,8 +501,41 @@ void rag_engine_clear(rag_engine_t * engine) {
     engine->doc_index.clear();
 }
 
-rag_result * rag_engine_query(rag_engine_t * engine,
-    const char * query, int32_t * n_results)
+// Filtered Hamming top-k against chunks whose doc_id begins with prefix
+// (or all chunks if prefix is null/empty).
+static std::vector<std::pair<int32_t, int32_t>> rag_bq_search_prefix(
+    const std::vector<uint64_t> & query_bq,
+    const std::vector<rag_chunk> & chunks,
+    int32_t top_k,
+    const char * doc_id_prefix
+) {
+    int32_t n_words = (int32_t)query_bq.size();
+    std::vector<std::pair<int32_t, int32_t>> distances;
+    distances.reserve(chunks.size());
+
+    bool has_prefix = (doc_id_prefix && doc_id_prefix[0] != '\0');
+    size_t prefix_len = has_prefix ? strlen(doc_id_prefix) : 0;
+
+    for (int32_t i = 0; i < (int32_t)chunks.size(); i++) {
+        if (has_prefix) {
+            const std::string & d = chunks[i].doc_id;
+            if (d.size() < prefix_len) continue;
+            if (memcmp(d.data(), doc_id_prefix, prefix_len) != 0) continue;
+        }
+        int32_t d = rag_hamming_distance(
+            query_bq.data(), chunks[i].bq_vector.data(), n_words);
+        distances.push_back({d, i});
+    }
+
+    int32_t k = std::min(top_k, (int32_t)distances.size());
+    if (k <= 0) { distances.clear(); return distances; }
+    std::partial_sort(distances.begin(), distances.begin() + k, distances.end());
+    distances.resize(k);
+    return distances;
+}
+
+static rag_result * rag_query_impl(rag_engine_t * engine,
+    const char * query, const char * doc_id_prefix, int32_t * n_results)
 {
     if (!engine || !query || !n_results) return nullptr;
     if (!rag_engine_is_loaded(engine)) return nullptr;
@@ -487,13 +544,12 @@ rag_result * rag_engine_query(rag_engine_t * engine,
     auto query_emb = rag_embed_text(engine, query);
     if (query_emb.empty()) return nullptr;
 
-    // BQ coarse search -> top_k candidates
     auto query_bq = rag_bq_quantize(query_emb.data(), engine->params.n_dims);
-    auto candidates = rag_bq_search(query_bq, engine->chunks, engine->params.top_k);
+    auto candidates = rag_bq_search_prefix(
+        query_bq, engine->chunks, engine->params.top_k, doc_id_prefix);
 
     if (candidates.empty()) { *n_results = 0; return nullptr; }
 
-    // Cosine re-rank -> top_n
     std::vector<std::pair<float, int32_t>> scored;
     scored.reserve(candidates.size());
     for (auto & [hamming_dist, chunk_idx] : candidates) {
@@ -524,6 +580,18 @@ rag_result * rag_engine_query(rag_engine_t * engine,
 
     *n_results = n;
     return results;
+}
+
+rag_result * rag_engine_query(rag_engine_t * engine,
+    const char * query, int32_t * n_results)
+{
+    return rag_query_impl(engine, query, nullptr, n_results);
+}
+
+rag_result * rag_engine_query_filtered(rag_engine_t * engine,
+    const char * query, const char * doc_id_prefix, int32_t * n_results)
+{
+    return rag_query_impl(engine, query, doc_id_prefix, n_results);
 }
 
 void rag_engine_free_results(rag_result * results, int32_t n) {
@@ -599,4 +667,243 @@ char * rag_engine_info_json(const rag_engine_t * engine) {
 
 void rag_engine_free_string(char * str) {
     free(str);
+}
+
+char * rag_engine_extract_text(const uint8_t * bytes, int32_t len,
+    const char * mime_hint, const char * name_hint)
+{
+    if (!bytes || len <= 0) return nullptr;
+
+    char * out = nullptr;
+    int rc = rag_ingest_extract(bytes, (size_t)len, mime_hint, name_hint, &out);
+    if (rc != 0 || !out) {
+        if (out) rag_ingest_free_string(out);
+        return nullptr;
+    }
+
+    // rag_ingest allocates via std::malloc, rag_engine_free_string calls free,
+    // so the caller can free the buffer directly.
+    return out;
+}
+
+// ============================================================================
+// Index export / import
+//
+// Binary format (little-endian throughout, length-prefixed):
+//   [magic 4]        "TNRG"
+//   [version 4]      uint32, currently 1
+//   [chunk_size 4]   int32
+//   [chunk_overlap 4] int32
+//   [n_dims 4]       int32
+//   [late_chunking 1] uint8 (0/1)
+//   [n_embd 4]       int32
+//   [fp_len 4] [fp bytes]    model fingerprint
+//   [n_docs 4]       int32
+//     repeated:
+//       [doc_id_len 4] [doc_id bytes]
+//       [first_chunk 4] [n_chunks 4]
+//   [n_chunks 4]     int32
+//     repeated:
+//       [doc_id_len 4] [doc_id bytes]
+//       [chunk_index 4]
+//       [text_len 4] [text bytes]
+//       [emb_dim 4]  [emb_dim * float32]
+//       [bq_words 4] [bq_words * uint64]
+// ============================================================================
+
+#define RAG_EXPORT_MAGIC   0x47524E54u  /* 'TNRG' little-endian */
+#define RAG_EXPORT_VERSION 1u
+
+namespace {
+
+struct WriteBuf {
+    std::vector<uint8_t> data;
+    void put_bytes(const void * p, size_t n) {
+        size_t off = data.size();
+        data.resize(off + n);
+        memcpy(data.data() + off, p, n);
+    }
+    void put_u32(uint32_t v) { put_bytes(&v, 4); }
+    void put_i32(int32_t  v) { put_bytes(&v, 4); }
+    void put_u8 (uint8_t  v) { put_bytes(&v, 1); }
+    void put_u64(uint64_t v) { put_bytes(&v, 8); }
+    void put_lp_str(const std::string & s) {
+        put_i32((int32_t)s.size());
+        if (!s.empty()) put_bytes(s.data(), s.size());
+    }
+    void put_lp_bytes(const void * p, int32_t n) {
+        put_i32(n);
+        if (n > 0) put_bytes(p, (size_t)n);
+    }
+};
+
+struct ReadBuf {
+    const uint8_t * p;
+    int32_t         remaining;
+    bool            err = false;
+
+    bool take(void * dst, size_t n) {
+        if (err || (size_t)remaining < n) { err = true; return false; }
+        memcpy(dst, p, n);
+        p += n;
+        remaining -= (int32_t)n;
+        return true;
+    }
+    bool get_u32(uint32_t & v) { return take(&v, 4); }
+    bool get_i32(int32_t  & v) { return take(&v, 4); }
+    bool get_u8 (uint8_t  & v) { return take(&v, 1); }
+    bool get_u64(uint64_t & v) { return take(&v, 8); }
+    bool get_lp_str(std::string & out) {
+        int32_t n; if (!get_i32(n) || n < 0) { err = true; return false; }
+        if ((size_t)remaining < (size_t)n) { err = true; return false; }
+        out.assign(reinterpret_cast<const char *>(p), (size_t)n);
+        p += n; remaining -= n;
+        return true;
+    }
+};
+
+}
+
+uint8_t * rag_engine_export_index(const rag_engine_t * engine, int32_t * out_size) {
+    if (!engine || !out_size) return nullptr;
+    *out_size = 0;
+
+    WriteBuf w;
+    w.put_u32(RAG_EXPORT_MAGIC);
+    w.put_u32(RAG_EXPORT_VERSION);
+    w.put_i32(engine->params.chunk_size);
+    w.put_i32(engine->params.chunk_overlap);
+    w.put_i32(engine->params.n_dims);
+    w.put_u8 (engine->params.late_chunking ? 1 : 0);
+    w.put_i32(engine->n_embd);
+    w.put_lp_str(engine->model_fingerprint);
+
+    w.put_i32((int32_t)engine->documents.size());
+    for (const auto & d : engine->documents) {
+        w.put_lp_str(d.doc_id);
+        w.put_i32(d.first_chunk);
+        w.put_i32(d.n_chunks);
+    }
+
+    w.put_i32((int32_t)engine->chunks.size());
+    for (const auto & c : engine->chunks) {
+        w.put_lp_str(c.doc_id);
+        w.put_i32(c.chunk_index);
+        w.put_lp_str(c.text);
+
+        w.put_i32((int32_t)c.embedding.size());
+        if (!c.embedding.empty()) {
+            w.put_bytes(c.embedding.data(),
+                c.embedding.size() * sizeof(float));
+        }
+
+        w.put_i32((int32_t)c.bq_vector.size());
+        if (!c.bq_vector.empty()) {
+            w.put_bytes(c.bq_vector.data(),
+                c.bq_vector.size() * sizeof(uint64_t));
+        }
+    }
+
+    size_t total = w.data.size();
+    auto * buf = (uint8_t *)malloc(total);
+    if (!buf) return nullptr;
+    memcpy(buf, w.data.data(), total);
+    *out_size = (int32_t)total;
+    return buf;
+}
+
+void rag_engine_free_buffer(uint8_t * buf) {
+    free(buf);
+}
+
+int32_t rag_engine_import_index(rag_engine_t * engine,
+    const uint8_t * buf, int32_t size)
+{
+    if (!engine) return -6;
+    if (!rag_engine_is_loaded(engine)) return -6;
+    if (!buf || size <= 0) return -5;
+
+    ReadBuf r{buf, size};
+
+    uint32_t magic = 0, version = 0;
+    if (!r.get_u32(magic))   return -5;
+    if (magic != RAG_EXPORT_MAGIC) return -1;
+    if (!r.get_u32(version)) return -5;
+    if (version != RAG_EXPORT_VERSION) return -2;
+
+    int32_t chunk_size = 0, chunk_overlap = 0, n_dims = 0, n_embd_in = 0;
+    uint8_t late_chunking = 0;
+    if (!r.get_i32(chunk_size))   return -5;
+    if (!r.get_i32(chunk_overlap)) return -5;
+    if (!r.get_i32(n_dims))       return -5;
+    if (!r.get_u8 (late_chunking)) return -5;
+    if (!r.get_i32(n_embd_in))    return -5;
+
+    if (n_dims != engine->params.n_dims) return -3;
+    if (n_embd_in != engine->n_embd)     return -3;
+
+    std::string fp;
+    if (!r.get_lp_str(fp)) return -5;
+    if (fp != engine->model_fingerprint) return -4;
+
+    int32_t n_docs = 0;
+    if (!r.get_i32(n_docs) || n_docs < 0) return -5;
+
+    std::vector<rag_document> documents;
+    documents.reserve((size_t)n_docs);
+    std::unordered_map<std::string, int32_t> doc_index;
+    doc_index.reserve((size_t)n_docs);
+
+    for (int32_t i = 0; i < n_docs; i++) {
+        rag_document d;
+        if (!r.get_lp_str(d.doc_id))   return -5;
+        if (!r.get_i32(d.first_chunk)) return -5;
+        if (!r.get_i32(d.n_chunks))    return -5;
+        doc_index[d.doc_id] = i;
+        documents.push_back(std::move(d));
+    }
+
+    int32_t n_chunks = 0;
+    if (!r.get_i32(n_chunks) || n_chunks < 0) return -5;
+
+    std::vector<rag_chunk> chunks;
+    chunks.reserve((size_t)n_chunks);
+
+    for (int32_t i = 0; i < n_chunks; i++) {
+        rag_chunk c;
+        if (!r.get_lp_str(c.doc_id))   return -5;
+        if (!r.get_i32(c.chunk_index)) return -5;
+        if (!r.get_lp_str(c.text))     return -5;
+
+        int32_t emb_dim = 0;
+        if (!r.get_i32(emb_dim) || emb_dim < 0) return -5;
+        if (emb_dim > 0) {
+            if ((size_t)r.remaining < (size_t)emb_dim * sizeof(float)) return -5;
+            c.embedding.resize((size_t)emb_dim);
+            if (!r.take(c.embedding.data(), (size_t)emb_dim * sizeof(float))) return -5;
+        }
+
+        int32_t bq_words = 0;
+        if (!r.get_i32(bq_words) || bq_words < 0) return -5;
+        if (bq_words > 0) {
+            if ((size_t)r.remaining < (size_t)bq_words * sizeof(uint64_t)) return -5;
+            c.bq_vector.resize((size_t)bq_words);
+            if (!r.take(c.bq_vector.data(), (size_t)bq_words * sizeof(uint64_t))) return -5;
+        }
+
+        chunks.push_back(std::move(c));
+    }
+
+    if (r.err) return -5;
+
+    // Adopt restored params (don't override n_threads / top_k / top_n)
+    engine->params.chunk_size    = chunk_size;
+    engine->params.chunk_overlap = chunk_overlap;
+    engine->params.late_chunking = (late_chunking != 0);
+
+    engine->chunks    = std::move(chunks);
+    engine->documents = std::move(documents);
+    engine->doc_index = std::move(doc_index);
+
+    return 0;
 }

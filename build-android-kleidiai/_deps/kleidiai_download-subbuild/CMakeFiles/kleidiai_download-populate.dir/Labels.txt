@@ -1,0 +1,14 @@
+# Target labels
+ kleidiai_download-populate
+# Source files and their labels
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/CMakeFiles/kleidiai_download-populate
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/CMakeFiles/kleidiai_download-populate.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/CMakeFiles/kleidiai_download-populate-complete.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-build.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-configure.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-download.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-install.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-mkdir.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-patch.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-test.rule
+/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-update.rule

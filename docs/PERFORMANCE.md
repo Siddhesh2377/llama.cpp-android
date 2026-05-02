@@ -45,25 +45,31 @@ These replace the generic C implementations with hand-tuned assembly for:
 
 ## Threading
 
+### Thread Engine (big.LITTLE-Aware)
+
+The engine detects CPU topology at runtime by reading `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq` for every online core. Cores above 70% of the maximum frequency are classified as performance cores; the rest as efficiency cores.
+
+Three modes are available, switchable at runtime via `ggml_engine_set_thread_mode(engine, mode)`:
+
+| Mode | Value | Gen Threads | Batch Threads | n_batch | Pins to P-cores |
+|------|-------|-------------|---------------|---------|-----------------|
+| Power Saving | 0 | 1 | E-cores only | 128 | No |
+| Balanced | 1 | 2 P-cores | All P-cores | 256 | Yes |
+| Performance | 2 | min(4, P) | All cores | 512 | Yes |
+
+Mode changes apply immediately to the live context — no model reload required.
+
 ### Prompt Processing (Compute-Bound)
 
-```
-n_threads_batch = all P-cores (e.g., 4 on Cortex-X3)
-```
-
-Prompt evaluation is compute-bound -- more threads means faster processing. Uses all available performance cores.
+Prompt evaluation is a series of full matrix multiplies — more threads = faster. The thread engine assigns all P-cores to this phase.
 
 ### Token Generation (Memory-Bound)
 
-```
-n_threads = min(4, P-cores)
-```
+Generation is a single matrix-vector multiply per token. It is memory-bandwidth-bound: more than 4 threads increases cache contention without improving throughput. The thread engine limits generation to 2–4 P-cores depending on mode.
 
-Generation is memory-bandwidth-bound (single-row matrix-vector multiply). Adding more threads increases cache contention without improving throughput.
+### Core Pinning
 
-### CPU Affinity
-
-The JNI bridge pins threads to performance cores via `sched_setaffinity`. This prevents the scheduler from migrating inference threads to efficiency cores, which would halve throughput.
+When `pin_to_perf_cores = true` (balanced and performance modes), the engine logs which cores are selected. The JNI bridge should additionally call `sched_setaffinity` on the calling thread before invoking `ggml_engine_generate()` for maximum isolation from the scheduler.
 
 ---
 

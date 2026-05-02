@@ -1,0 +1,15 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/ggml/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/ggml/src/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/ggml/src/ggml-cpu/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-build/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/src/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/common/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/engine/cmake_install.cmake",
+		"/home/home/dev/include/llama.cpp/build-android-kleidiai/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

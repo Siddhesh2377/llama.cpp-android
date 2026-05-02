@@ -6,7 +6,7 @@ Complete C API reference for the Tool-Neuron engine components. All headers are 
 
 ## GGMLEngine (`ggml-engine.h`)
 
-Core LLM inference engine. Handles model loading, text generation, context management, tokenization, control vectors, and VLM support.
+Core LLM inference engine. Handles model loading, text generation, context management, tokenization, control vectors, VLM support, and thread mode control.
 
 ### Types
 
@@ -38,15 +38,18 @@ Engine configuration. Get defaults with `ggml_engine_default_params()`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `n_ctx` | `int32_t` | 0 | Context size (0 = model default) |
-| `n_batch` | `int32_t` | 512 | Batch size for prompt processing |
-| `n_threads` | `int32_t` | 0 | Thread count (0 = auto-detect) |
-| `n_threads_batch` | `int32_t` | 0 | Threads for batch processing (0 = same as `n_threads`) |
+| `n_batch` | `int32_t` | 0 | Prompt batch size (0 = set by thread_mode) |
+| `n_threads` | `int32_t` | 0 | Generation threads (0 = set by thread_mode) |
+| `n_threads_batch` | `int32_t` | 0 | Prompt-eval threads (0 = set by thread_mode) |
 | `use_mmap` | `bool` | true | Memory-map model file |
-| `use_mlock` | `bool` | false | Lock model in memory |
-| `n_gpu_layers` | `int32_t` | 0 | Always 0 (CPU-only) |
+| `use_mlock` | `bool` | false | Lock model in RAM (prevents paging) |
+| `n_gpu_layers` | `int32_t` | 0 | Always 0 (CPU-only build) |
 | `rope_freq_base` | `float` | 0.0 | RoPE base frequency (0 = model default) |
 | `rope_freq_scale` | `float` | 0.0 | RoPE frequency scale (0 = model default) |
-| `flash_attn` | `bool` | false | Flash attention |
+| `flash_attn` | `bool` | true | Flash attention (reduces KV memory ~20%) |
+| `thread_mode` | `int32_t` | 1 | Thread mode: 0=power_saving, 1=balanced, 2=performance, -1=manual |
+
+**Note:** When `thread_mode >= 0`, the engine auto-configures `n_threads`, `n_threads_batch`, and `n_batch` from the big.LITTLE topology of the device. Set `thread_mode = -1` and provide explicit values to override.
 
 #### `ggml_engine_sampling`
 
@@ -54,7 +57,7 @@ Sampling parameters. Get defaults with `ggml_engine_default_sampling()`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `temperature` | `float` | 0.8 | Sampling temperature (0.0 = greedy) |
+| `temperature` | `float` | 0.7 | Sampling temperature (0.0 = greedy) |
 | `top_k` | `int32_t` | 40 | Top-k sampling (0 = disabled) |
 | `top_p` | `float` | 0.95 | Nucleus sampling (1.0 = disabled) |
 | `min_p` | `float` | 0.05 | Min-p sampling (0.0 = disabled) |
@@ -63,9 +66,9 @@ Sampling parameters. Get defaults with `ggml_engine_default_sampling()`.
 | `frequency_penalty` | `float` | 0.0 | Frequency penalty |
 | `presence_penalty` | `float` | 0.0 | Presence penalty |
 | `seed` | `uint32_t` | 0xFFFFFFFF | Random seed (0xFFFFFFFF = random) |
-| `n_predict` | `int32_t` | -1 | Max tokens (-1 = unlimited) |
-| `stop_sequences` | `const char*[8]` | NULL | Up to 8 stop sequences |
-| `stop_sequence_count` | `int32_t` | 0 | Number of stop sequences |
+| `n_predict` | `int32_t` | 256 | Max tokens to generate |
+| `stop_sequences` | `const char*[8]` | NULL | Up to 8 stop strings |
+| `stop_sequence_count` | `int32_t` | 0 | Number of active stop strings |
 
 #### `ggml_engine_perf`
 
@@ -82,15 +85,15 @@ Performance metrics from the last generation.
 
 #### `ggml_engine_context_info`
 
-Full context window status, with optional prompt estimation.
+Full context window status.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `total` | `int32_t` | Total context capacity |
 | `used` | `int32_t` | Tokens currently in KV cache |
 | `remaining` | `int32_t` | Total minus used |
-| `prompt_estimate` | `int32_t` | Estimated tokens for pending prompt (-1 if no prompt) |
-| `after_prompt` | `int32_t` | Remaining after prompt (-1 if no prompt) |
+| `prompt_estimate` | `int32_t` | Estimated tokens for pending prompt (-1 if no prompt given) |
+| `after_prompt` | `int32_t` | Remaining after prompt (-1 if no prompt given) |
 
 #### `ggml_engine_vectors`
 
@@ -98,9 +101,21 @@ Mean hidden-state vector extracted from a prompt.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `data` | `float *` | `n_embd` floats, mean hidden-state vector |
+| `data` | `float *` | `n_embd` floats |
 | `n_embd` | `int32_t` | Embedding dimension |
 | `n_tokens` | `int32_t` | Number of tokens processed |
+
+#### `ggml_engine_device_info`
+
+Device CPU topology (read-only, populated at runtime).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `n_cores_total` | `int32_t` | Total online CPU cores |
+| `n_perf_cores` | `int32_t` | Performance cores (>70% max freq) |
+| `n_efficiency_cores` | `int32_t` | Efficiency cores |
+| `max_freq_khz` | `int32_t` | Highest core frequency (kHz) |
+| `min_freq_khz` | `int32_t` | Lowest core frequency (kHz) |
 
 #### Callback Types
 
@@ -137,10 +152,12 @@ void               ggml_engine_unload_model(ggml_engine_t * engine);
 bool               ggml_engine_is_loaded(const ggml_engine_t * engine);
 ```
 
+`load_model_from_fd` accepts an Android SAF file descriptor. Internally resolves `/proc/self/fd/<fd>`.
+
 #### Model Information
 
 ```c
-// Returns JSON string with model metadata. Caller must free.
+// Returns JSON string. Caller must free with ggml_engine_free_string.
 char * ggml_engine_model_info_json(const ggml_engine_t * engine);
 void   ggml_engine_free_string(char * str);
 ```
@@ -148,22 +165,22 @@ void   ggml_engine_free_string(char * str);
 #### Text Generation
 
 ```c
-// Generate text from prompt. Clears KV cache first.
+// Generate text. Clears KV cache before processing.
 ggml_engine_status ggml_engine_generate(
     ggml_engine_t * engine, const char * prompt,
     ggml_engine_sampling sampling,
     ggml_engine_token_callback callback, void * user_data);
 
-// Generate text from prompt. Appends to existing KV cache (multi-turn).
+// Generate text. Appends to existing KV cache (multi-turn conversation).
 ggml_engine_status ggml_engine_generate_continue(
     ggml_engine_t * engine, const char * prompt,
     ggml_engine_sampling sampling,
     ggml_engine_token_callback callback, void * user_data);
 
-// Cancel ongoing generation (thread-safe).
+// Cancel in-progress generation. Thread-safe.
 void ggml_engine_cancel(ggml_engine_t * engine);
 
-// Get full text from last generation. Caller must free.
+// Get full response text from last generation. Caller must free.
 char * ggml_engine_get_response(const ggml_engine_t * engine);
 ```
 
@@ -175,8 +192,7 @@ int32_t ggml_engine_context_used(const ggml_engine_t * engine);
 int32_t ggml_engine_context_size(const ggml_engine_t * engine);
 int32_t ggml_engine_context_remaining(const ggml_engine_t * engine);
 
-// Full context status with optional prompt estimation.
-// Pass NULL for prompt to skip estimation.
+// Full context status. Pass NULL for prompt to skip token estimation.
 ggml_engine_context_info ggml_engine_context_status(
     const ggml_engine_t * engine, const char * prompt);
 ```
@@ -184,13 +200,48 @@ ggml_engine_context_info ggml_engine_context_status(
 #### Tokenization
 
 ```c
-// Returns number of tokens, or -1 on error.
+// Returns token count, or -1 on error.
 int32_t ggml_engine_tokenize(const ggml_engine_t * engine,
     const char * text, int32_t * tokens, int32_t max_tokens);
 
-// Caller must free returned string.
+// Caller must free.
 char * ggml_engine_detokenize(const ggml_engine_t * engine,
     const int32_t * tokens, int32_t n_tokens);
+```
+
+#### Thread Mode (big.LITTLE-aware)
+
+```c
+// Switch thread mode at runtime. Applies immediately to the live context.
+// mode: 0 = power_saving, 1 = balanced, 2 = performance
+void ggml_engine_set_thread_mode(ggml_engine_t * engine, int32_t mode);
+```
+
+Thread mode controls how inference threads are distributed across CPU cores:
+
+| Mode | Value | Generation Threads | Batch Threads | n_batch | Core Pinning |
+|------|-------|--------------------|---------------|---------|--------------|
+| Power Saving | 0 | 1 | E-cores only | 128 | No |
+| Balanced | 1 | 2 P-cores | All P-cores | 256 | Yes |
+| Performance | 2 | min(4, P-cores) | All cores | 512 | Yes |
+
+Expose mode directly to UI as a 0-2 seekbar value. No additional mapping needed.
+
+#### Device & Memory Queries
+
+```c
+// Read device CPU topology (reads /sys/devices/system/cpu/ on Android).
+ggml_engine_device_info ggml_engine_get_device_info(void);
+
+// Available RAM in bytes (-1 on error). Reads /proc/meminfo on Android.
+int64_t ggml_engine_available_ram(void);
+
+// Maximum model file size (bytes) that fits given available RAM and context size.
+// Accounts for KV cache and OS overhead.
+int64_t ggml_engine_max_model_size(int64_t available_ram, int32_t n_ctx);
+
+// Recommended n_batch for a given model file size and current free RAM.
+int32_t ggml_engine_recommend_batch(int64_t model_size_bytes);
 ```
 
 #### Control Vectors
@@ -198,15 +249,14 @@ char * ggml_engine_detokenize(const ggml_engine_t * engine,
 Extract and apply control vectors (representation engineering) for steering model behavior at the hidden-state level.
 
 ```c
-// Extract mean hidden-state vector from a prompt. Caller must free.
+// Extract mean hidden-state vector. Caller must free.
 ggml_engine_vectors * ggml_engine_calc_vectors(
     ggml_engine_t * engine, const char * prompt,
     ggml_engine_progress_cb progress, void * user_data);
 
 void ggml_engine_free_vectors(ggml_engine_vectors * v);
 
-// Apply control vector uniformly across layers.
-// il_start/il_end: -1 = all layers. Returns false on failure.
+// Apply control vector across layers. il_start/il_end = -1 means all layers.
 bool ggml_engine_apply_vectors(
     ggml_engine_t * engine, const ggml_engine_vectors * vectors,
     float strength, int32_t il_start, int32_t il_end);
@@ -227,34 +277,41 @@ ggml_engine_perf ggml_engine_get_perf(const ggml_engine_t * engine);
 
 bool on_token(const char * text, void * user) {
     printf("%s", text);
+    fflush(stdout);
     return true;
 }
 
 int main() {
     ggml_engine_params params = ggml_engine_default_params();
     params.n_ctx = 2048;
-    params.n_threads = 4;
+    params.thread_mode = 2; // performance
 
     ggml_engine_t * engine = ggml_engine_create(params);
+
+    // Query device before loading to pick appropriate model size
+    ggml_engine_device_info dev = ggml_engine_get_device_info();
+    int64_t ram = ggml_engine_available_ram();
+    int64_t max_model = ggml_engine_max_model_size(ram, 2048);
+    printf("Device: %d perf cores, %d eff cores, max model: %lld MB\n",
+           dev.n_perf_cores, dev.n_efficiency_cores, (long long)max_model >> 20);
+
     ggml_engine_load_model(engine, "model.gguf");
 
     ggml_engine_sampling sampling = ggml_engine_default_sampling();
-    sampling.temperature = 0.7;
+    sampling.temperature = 0.7f;
     sampling.n_predict = 256;
 
-    // First turn clears KV cache
-    ggml_engine_generate(engine, "Hello, world!", sampling, on_token, NULL);
+    // First turn
+    ggml_engine_generate(engine, "Hello!", sampling, on_token, NULL);
 
-    // Continue conversation without clearing cache
+    // Multi-turn: preserve KV cache
     ggml_engine_generate_continue(engine, "Tell me more.", sampling, on_token, NULL);
 
-    // Check context usage
-    ggml_engine_context_info info = ggml_engine_context_status(engine, "next prompt");
-    printf("\nContext: %d/%d used, prompt ~%d tokens\n",
-           info.used, info.total, info.prompt_estimate);
+    // Switch to power saving mid-session
+    ggml_engine_set_thread_mode(engine, 0);
 
     ggml_engine_perf perf = ggml_engine_get_perf(engine);
-    printf("%.1f tokens/sec\n", perf.generation_tokens_per_sec);
+    printf("\n%.1f t/s\n", perf.generation_tokens_per_sec);
 
     ggml_engine_free(engine);
 }
@@ -264,7 +321,7 @@ int main() {
 
 ## VLM Support (`ggml-engine.h`)
 
-Vision-language model support. Loads a vision projector (mmproj GGUF) and generates text from images and text prompts. Supports 20+ VLM architectures. CPU-only.
+Vision-language model support. Loads a vision projector (mmproj GGUF) alongside the text model. Supports 20+ architectures. CPU-only.
 
 ### Types
 
@@ -276,7 +333,7 @@ Opaque VLM handle. Created with `ggml_engine_vlm_load()`, destroyed with `ggml_e
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `n_threads` | `int32_t` | 0 | Threads for vision encode (0 = same as engine) |
+| `n_threads` | `int32_t` | 0 | Vision encoder threads (0 = same as engine) |
 | `image_min_tokens` | `int32_t` | -1 | Min image tokens (-1 = model default) |
 | `image_max_tokens` | `int32_t` | -1 | Max image tokens (-1 = model default) |
 
@@ -284,27 +341,33 @@ Opaque VLM handle. Created with `ggml_engine_vlm_load()`, destroyed with `ggml_e
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `data` | `const unsigned char *` | File bytes (JPEG/PNG/etc.) or raw RGB pixels |
+| `data` | `const unsigned char *` | File bytes (JPEG/PNG) or raw RGB pixels |
 | `size` | `size_t` | Byte count |
-| `width` | `uint32_t` | Pixel width (0 = file mode, auto-detect) |
+| `width` | `uint32_t` | Pixel width (0 = file mode, auto-detect format) |
 | `height` | `uint32_t` | Pixel height (0 = file mode) |
+
+When `width == 0 && height == 0`, the image is loaded as a compressed file (JPEG/PNG/etc.). When `width > 0 && height > 0`, `data` must be raw RGB24 pixels.
 
 ### Functions
 
 ```c
 ggml_engine_vlm_params ggml_engine_vlm_default_params(void);
 
-// Load vision projector. Call after loading text model.
+// Load vision projector. Must be called after loading the text model.
 ggml_engine_vlm_t * ggml_engine_vlm_load(
     ggml_engine_t * engine, const char * mmproj_path,
     ggml_engine_vlm_params params);
+
+// Load from Android SAF file descriptor.
 ggml_engine_vlm_t * ggml_engine_vlm_load_from_fd(
     ggml_engine_t * engine, int fd,
     ggml_engine_vlm_params params);
+
 void ggml_engine_vlm_free(ggml_engine_vlm_t * vlm);
 bool ggml_engine_vlm_is_loaded(const ggml_engine_vlm_t * vlm);
 
-// Generate from text + images. Use "<__media__>" markers for image positions.
+// Generate from text + images. Place "<__media__>" markers in prompt for image positions.
+// images may be NULL if n_images == 0.
 ggml_engine_status ggml_engine_vlm_generate(
     ggml_engine_t * engine, ggml_engine_vlm_t * vlm,
     const char * prompt,
@@ -312,11 +375,11 @@ ggml_engine_status ggml_engine_vlm_generate(
     ggml_engine_sampling sampling,
     ggml_engine_token_callback callback, void * user_data);
 
-// Encode image only. Returns token count, -1 on error.
+// Count tokens produced by encoding one image. Returns -1 on error.
 int32_t ggml_engine_vlm_encode_image(
     ggml_engine_vlm_t * vlm, const ggml_engine_image * image);
 
-// VLM info as JSON. Caller must free with ggml_engine_free_string.
+// JSON info string. Caller must free with ggml_engine_free_string.
 char * ggml_engine_vlm_info_json(const ggml_engine_vlm_t * vlm);
 
 const char * ggml_engine_vlm_default_marker(void);
@@ -329,32 +392,28 @@ bool ggml_engine_vlm_supports_audio(const ggml_engine_vlm_t * vlm);
 ```c
 #include "ggml-engine.h"
 
-bool on_token(const char * text, void * user) {
-    printf("%s", text);
-    return true;
-}
+bool on_token(const char * text, void * user) { printf("%s", text); return true; }
 
 int main() {
     ggml_engine_params params = ggml_engine_default_params();
-    params.n_ctx = 2048;
     ggml_engine_t * engine = ggml_engine_create(params);
     ggml_engine_load_model(engine, "smolvlm-500m.gguf");
 
-    ggml_engine_vlm_params vp = ggml_engine_vlm_default_params();
-    ggml_engine_vlm_t * vlm = ggml_engine_vlm_load(engine, "mmproj.gguf", vp);
+    ggml_engine_vlm_t * vlm = ggml_engine_vlm_load(
+        engine, "mmproj.gguf", ggml_engine_vlm_default_params());
 
-    // Load image bytes
     FILE * f = fopen("photo.jpg", "rb");
-    fseek(f, 0, SEEK_END); size_t sz = ftell(f); fseek(f, 0, SEEK_SET);
+    fseek(f, 0, SEEK_END); size_t sz = ftell(f); rewind(f);
     unsigned char * buf = malloc(sz);
     fread(buf, 1, sz, f); fclose(f);
 
     ggml_engine_image img = { .data = buf, .size = sz, .width = 0, .height = 0 };
-    ggml_engine_sampling sampling = ggml_engine_default_sampling();
-    sampling.n_predict = 256;
+    ggml_engine_sampling s = ggml_engine_default_sampling();
+    s.n_predict = 256;
 
-    ggml_engine_vlm_generate(engine, vlm, "<__media__>\nDescribe this image.",
-                             &img, 1, sampling, on_token, NULL);
+    ggml_engine_vlm_generate(engine, vlm,
+        "<__media__>\nDescribe this image.",
+        &img, 1, s, on_token, NULL);
 
     free(buf);
     ggml_engine_vlm_free(vlm);
@@ -364,13 +423,13 @@ int main() {
 
 ### Supported Architectures
 
-LLaVA, SigLIP (Gemma3-Vision), Qwen2-VL, Qwen3-VL, Pixtral, MiniCPM-V, InternVL, CogVLM, GLM4V, Llama4, MobileNetV5 (Gemma3n-Vision), Kimi-VL, Kimi-K2.5, SmolVLM, PaddleOCR, Nemotron-V2, YouTu-VL, Whisper, Conformer.
+LLaVA, SigLIP (Gemma3-Vision), Qwen2-VL, Qwen3-VL, Pixtral, MiniCPM-V, InternVL, CogVLM, GLM4V, Llama4, MobileNetV5 (Gemma3n-Vision), Kimi-VL, Kimi-K2.5, SmolVLM, PaddleOCR, Nemotron-V2, YouTu-VL, Whisper (audio), Conformer (audio).
 
 ---
 
 ## RAG Engine (`rag-engine.h`)
 
-Retrieval-augmented generation with late chunking and binary-quantized embeddings. Uses a separate embedding model. Model-agnostic: the RAG index survives LLM swaps.
+Retrieval-augmented generation with late chunking and binary-quantized embeddings. Uses a dedicated embedding model. The index is independent of the LLM — survives model swaps.
 
 ### Types
 
@@ -382,13 +441,13 @@ Opaque handle. Created with `rag_engine_create()`, destroyed with `rag_engine_fr
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `n_threads` | `int32_t` | 0 | Thread count (0 = auto) |
+| `n_threads` | `int32_t` | 0 | Encoder threads (0 = auto) |
 | `chunk_size` | `int32_t` | 256 | Tokens per chunk |
-| `chunk_overlap` | `int32_t` | 32 | Overlap tokens between chunks |
+| `chunk_overlap` | `int32_t` | 32 | Overlap between adjacent chunks |
 | `n_dims` | `int32_t` | 256 | Matryoshka embedding dim: 768/512/256/128 |
-| `top_k` | `int32_t` | 32 | BQ search candidates before re-rank |
+| `top_k` | `int32_t` | 32 | BQ Hamming candidates before re-rank |
 | `top_n` | `int32_t` | 5 | Final results after cosine re-rank |
-| `late_chunking` | `bool` | true | Embed full doc then chunk (context-aware) |
+| `late_chunking` | `bool` | true | Context-aware chunking (recommended) |
 
 #### `rag_result`
 
@@ -397,7 +456,7 @@ Opaque handle. Created with `rag_engine_create()`, destroyed with `rag_engine_fr
 | `text` | `const char *` | Matched chunk text |
 | `doc_id` | `const char *` | Document identifier |
 | `chunk_index` | `int32_t` | Chunk index within document |
-| `score` | `float` | Cosine similarity (0.0--1.0) |
+| `score` | `float` | Cosine similarity (0.0–1.0) |
 
 ### Functions
 
@@ -412,7 +471,7 @@ int32_t rag_engine_load_model(rag_engine_t * engine, const char * path);
 int32_t rag_engine_load_model_from_fd(rag_engine_t * engine, int fd);
 bool    rag_engine_is_loaded(const rag_engine_t * engine);
 
-// Indexing (returns chunk count, -1 on error)
+// Indexing (returns chunk count on success, -1 on error)
 int32_t rag_engine_add_document(rag_engine_t * engine,
             const char * text, const char * doc_id);
 int32_t rag_engine_remove_document(rag_engine_t * engine, const char * doc_id);
@@ -421,15 +480,17 @@ int32_t rag_engine_document_count(const rag_engine_t * engine);
 int32_t rag_engine_chunk_count(const rag_engine_t * engine);
 
 // Retrieval (two-stage: BQ Hamming -> cosine re-rank)
+// Returns NULL if no results. Caller must free with rag_engine_free_results.
 rag_result * rag_engine_query(rag_engine_t * engine,
                  const char * query, int32_t * n_results);
 void         rag_engine_free_results(rag_result * results, int32_t n);
 
-// Build augmented prompt with retrieved context
+// Build prompt with retrieved context injected. Caller must free.
+// Returns NULL if engine or query is NULL.
 char * rag_engine_build_prompt(rag_engine_t * engine,
            const char * query, const char * user_prompt);
 
-// Info as JSON. Caller must free.
+// Engine info as JSON. Caller must free.
 char * rag_engine_info_json(const rag_engine_t * engine);
 void   rag_engine_free_string(char * str);
 ```
@@ -455,23 +516,28 @@ int main() {
         printf("[%.3f] %s: %s\n", results[i].score, results[i].doc_id, results[i].text);
     rag_engine_free_results(results, n);
 
+    // Inject context directly into an LLM prompt
+    char * prompt = rag_engine_build_prompt(rag, "cell energy", "Explain this to me.");
+    // ... pass prompt to ggml_engine_generate ...
+    rag_engine_free_string(prompt);
+
     rag_engine_free(rag);
 }
 ```
 
 ### How It Works
 
-1. **Late chunking** -- full document is embedded with bidirectional attention, then token embeddings are chunked. Preserves cross-chunk context.
-2. **Matryoshka truncation** -- 768-dim embeddings truncated to `n_dims` without retraining. 3x compression at 256 dims.
-3. **Binary quantization** -- float embeddings thresholded to 1-bit vectors. 32x compression. Hamming distance for fast candidate search.
-4. **Two-stage retrieval** -- BQ Hamming finds `top_k` candidates, cosine similarity re-ranks to `top_n` final results.
-5. **Sliding window** -- documents longer than model context are processed in overlapping windows with averaged overlap regions.
+1. **Late chunking** — full document embedded with bidirectional attention, then token embeddings split into chunks. Preserves cross-chunk context lost by naive chunking.
+2. **Matryoshka truncation** — 768-dim embeddings truncated to `n_dims` without retraining. 3x memory saving at 256 dims.
+3. **Binary quantization** — floats thresholded to 1-bit. 32x compression. Hamming distance for O(1)-per-bit candidate search.
+4. **Two-stage retrieval** — BQ Hamming finds `top_k` candidates, cosine similarity re-ranks to `top_n` final results.
+5. **Sliding window** — documents longer than model context are processed in overlapping windows with averaged overlap regions.
 
 ---
 
 ## ToolManager (`tool-manager.h`)
 
-Model-agnostic tool calling. Parses tool calls from model output in JSON, XML, and function-call formats. Supports multiple concurrent tool calls per response.
+Model-agnostic tool calling. Parses tool calls from model output in JSON, XML, and function-call formats. Supports multiple tool calls per response.
 
 ### Types
 
@@ -496,26 +562,28 @@ typedef enum {
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `const char *` | Parameter name |
-| `description` | `const char *` | Parameter description |
+| `description` | `const char *` | Human-readable description |
 | `type` | `tool_param_type` | Data type |
-| `required` | `bool` | Whether parameter is required |
+| `required` | `bool` | Whether parameter is required for validation |
 
 #### `tool_def`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | `const char *` | Tool name |
-| `description` | `const char *` | Tool description |
-| `params` | `tool_param_def *` | Parameter definitions |
+| `description` | `const char *` | Tool description shown to model |
+| `params` | `tool_param_def *` | Parameter definitions array |
 | `n_params` | `int32_t` | Number of parameters |
 
 #### `tool_call_result`
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `tool_name` | `const char *` | Name of the called tool |
-| `arguments_json` | `const char *` | JSON string of parsed arguments |
-| `is_valid` | `bool` | Whether parsing succeeded |
+| `tool_name` | `const char *` | Name of parsed tool (heap-allocated) |
+| `arguments_json` | `const char *` | JSON string of arguments (heap-allocated) |
+| `is_valid` | `bool` | true if parsing and validation succeeded |
+
+Both `tool_name` and `arguments_json` must be freed. Use `tool_manager_free_results()` for arrays, or `free()` for the single-result case.
 
 #### `tool_execute_callback`
 
@@ -523,6 +591,8 @@ typedef enum {
 typedef const char * (*tool_execute_callback)(
     const char * tool_name, const char * args_json, void * user_data);
 ```
+
+The returned string is owned by the caller and will not be freed by the engine.
 
 ### Functions
 
@@ -535,20 +605,22 @@ void             tool_manager_free(tool_manager_t * tm);
 void tool_manager_register(tool_manager_t * tm, const tool_def * tool);
 void tool_manager_clear(tool_manager_t * tm);
 
-// Generate system prompt describing available tools. Caller must free.
+// System prompt. Caller must free with tool_manager_free_string.
 char * tool_manager_get_prompt(const tool_manager_t * tm);
 
-// Parse first tool call from model output.
+// Parse first valid tool call from model output.
+// result.is_valid == false if no tool call found.
 tool_call_result tool_manager_parse_output(
     const tool_manager_t * tm, const char * model_output);
 
-// Parse all tool calls. Caller must free with tool_manager_free_results.
+// Parse all valid tool calls. Returns NULL if none found.
+// Caller must free with tool_manager_free_results.
 tool_call_result * tool_manager_parse_output_all(
     const tool_manager_t * tm, const char * model_output,
     int32_t * n_calls);
 void tool_manager_free_results(tool_call_result * results, int32_t n_calls);
 
-// Execution
+// Execute a parsed call via the registered callback. Caller must free result string.
 void   tool_manager_set_callback(tool_manager_t * tm,
            tool_execute_callback cb, void * user_data);
 char * tool_manager_execute(tool_manager_t * tm, const tool_call_result * call);
@@ -560,20 +632,19 @@ void tool_manager_free_string(char * str);
 
 **JSON (OpenAI-style)**
 ```json
-{"name": "get_weather", "arguments": {"city": "Tokyo"}}
+{"tool": "get_weather", "arguments": {"city": "Tokyo"}}
 ```
+
+Also accepts `"name"` and `"function"` as alternate keys for the tool name, and `"params"` / `"parameters"` as alternate keys for arguments.
 
 **XML**
 ```xml
-<tool_call>
-  <name>get_weather</name>
-  <arguments>{"city": "Tokyo"}</arguments>
-</tool_call>
+<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>
 ```
 
 **Function-call**
 ```
-get_weather(city="Tokyo")
+get_weather({"city": "Tokyo"})
 ```
 
 ### Usage Example
@@ -584,31 +655,46 @@ get_weather(city="Tokyo")
 tool_param_def weather_params[] = {
     { "city", "City name", TOOL_PARAM_STRING, true },
 };
-
 tool_def weather_tool = {
-    .name = "get_weather", .description = "Get weather for a city",
+    .name = "get_weather",
+    .description = "Get current weather for a city.",
     .params = weather_params, .n_params = 1,
 };
 
-tool_manager_t * tm = tool_manager_create();
-tool_manager_register(tm, &weather_tool);
+const char * execute(const char * name, const char * args, void * user) {
+    return "{\"temp\": 22, \"condition\": \"sunny\"}";
+}
 
-char * prompt = tool_manager_get_prompt(tm);
-// ... inject prompt, run generation ...
+int main() {
+    tool_manager_t * tm = tool_manager_create();
+    tool_manager_register(tm, &weather_tool);
+    tool_manager_set_callback(tm, execute, NULL);
 
-tool_call_result result = tool_manager_parse_output(tm, model_output);
-if (result.is_valid)
-    printf("Tool: %s  Args: %s\n", result.tool_name, result.arguments_json);
+    // Inject into system prompt
+    char * sys_prompt = tool_manager_get_prompt(tm);
+    // ... pass sys_prompt to engine ...
+    tool_manager_free_string(sys_prompt);
 
-tool_manager_free_string(prompt);
-tool_manager_free(tm);
+    // Parse model output
+    const char * output = "{\"tool\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}";
+    tool_call_result result = tool_manager_parse_output(tm, output);
+    if (result.is_valid) {
+        char * response = tool_manager_execute(tm, &result);
+        printf("Result: %s\n", response);
+        tool_manager_free_string(response);
+        free((void *)result.tool_name);
+        free((void *)result.arguments_json);
+    }
+
+    tool_manager_free(tm);
+}
 ```
 
 ---
 
 ## Logging
 
-Two logging interfaces are provided: the internal logging system (`tn-log.h`) used by engine code, and the public log callback in `ggml-engine.h` for application-level log capture.
+Two interfaces: the internal `tn-log.h` used by engine code, and the public callback in `ggml-engine.h` for application-level log capture.
 
 ### Internal Logging (`tn-log.h`)
 
@@ -623,12 +709,13 @@ enum tn_log_level : int32_t {
 typedef void (*tn_log_callback)(enum tn_log_level level,
     const char * tag, const char * msg, void * user_data);
 
+// Thread-safe. Callback + user_data are updated atomically as a pair.
 void tn_log_set_callback(tn_log_callback cb, void * user_data);
 void tn_log_set_level(enum tn_log_level max_level);
 void tn_log_write(enum tn_log_level level, const char * tag, const char * fmt, ...);
 ```
 
-Convenience macros (tag defaults to `__FILE__`):
+Convenience macros (tag = `__FILE__`):
 
 ```c
 TN_LOG_ERR(fmt, ...)
@@ -636,6 +723,8 @@ TN_LOG_WRN(fmt, ...)
 TN_LOG_INF(fmt, ...)
 TN_LOG_DBG(fmt, ...)
 ```
+
+Default sink: Android logcat on Android, stderr/stdout on other platforms.
 
 ### Public Log Callback (`ggml-engine.h`)
 
@@ -650,25 +739,20 @@ typedef enum {
 typedef void (*tn_engine_log_callback)(tn_engine_log_level level,
     const char * tag, const char * msg, void * user_data);
 
-// Pass NULL to restore default (Android logcat / stderr).
+// Pass NULL to restore default sink.
 void tn_engine_set_log_callback(tn_engine_log_callback cb, void * user_data);
 void tn_engine_set_log_level(tn_engine_log_level max_level);
 ```
 
-### Usage Example
+### Usage
 
 ```c
-#include "ggml-engine.h"
-
 void my_logger(tn_engine_log_level level, const char * tag,
                const char * msg, void * user) {
-    const char * lvl[] = { "ERR", "WRN", "INF", "DBG" };
-    fprintf(stderr, "[%s] %s: %s\n", lvl[level], tag, msg);
+    const char * prefix[] = { "ERR", "WRN", "INF", "DBG" };
+    fprintf(stderr, "[%s] %s: %s\n", prefix[level], tag, msg);
 }
 
-int main() {
-    tn_engine_set_log_callback(my_logger, NULL);
-    tn_engine_set_log_level(TN_ENGINE_LOG_INFO);
-    // ... engine usage ...
-}
+tn_engine_set_log_callback(my_logger, NULL);
+tn_engine_set_log_level(TN_ENGINE_LOG_INFO);
 ```

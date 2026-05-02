@@ -68,6 +68,8 @@ add_library(${TARGET} STATIC
     sampling.h
     unicode.cpp
     unicode.h
+    universal-toolcall.cpp
+    universal-toolcall.h
     jinja/lexer.cpp
     jinja/lexer.h
     jinja/parser.cpp

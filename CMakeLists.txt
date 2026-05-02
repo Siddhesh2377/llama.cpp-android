@@ -97,6 +97,12 @@ if (LLAMA_BUILD_COMMON)
     add_subdirectory(engine)
 endif()
 
+option(LLAMA_BUILD_TESTS "llama: build tests" ${LLAMA_STANDALONE})
+if (LLAMA_BUILD_TESTS AND LLAMA_BUILD_COMMON)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 # licenses
 file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
 foreach(FILE_PATH ${EXTRA_LICENSES})

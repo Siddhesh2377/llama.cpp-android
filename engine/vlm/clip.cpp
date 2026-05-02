@@ -2255,15 +2255,29 @@ void clip_build_img_from_pixels(const unsigned char * rgb_pixels, int nx, int ny
 }
 
 // Normalize image to float32 - careful with pytorch .to(model.device, dtype=torch.float16) - this sometimes reduces precision (32>16>32), sometimes not
+// Unroll by 3 to eliminate the per-pixel `i % 3` channel index and fuse
+// `(x/255 - mean) / std` into a single `x * scale + bias`.
 static void normalize_image_u8_to_f32(const clip_image_u8 & src, clip_image_f32 & dst, const float mean[3], const float std[3]) {
     dst.nx = src.nx;
     dst.ny = src.ny;
-    dst.buf.resize(src.buf.size());
+    const size_t n = src.buf.size();
+    dst.buf.resize(n);
 
-    // TODO @ngxson : seems like this could be done more efficiently on cgraph
-    for (size_t i = 0; i < src.buf.size(); ++i) {
-        int c = i % 3; // rgb
-        dst.buf[i] = (static_cast<float>(src.buf[i]) / 255.0f - mean[c]) / std[c];
+    const float scale_0 = 1.0f / (255.0f * std[0]);
+    const float scale_1 = 1.0f / (255.0f * std[1]);
+    const float scale_2 = 1.0f / (255.0f * std[2]);
+    const float bias_0  = -mean[0] / std[0];
+    const float bias_1  = -mean[1] / std[1];
+    const float bias_2  = -mean[2] / std[2];
+
+    const uint8_t * __restrict sbuf = src.buf.data();
+    float         * __restrict dbuf = dst.buf.data();
+
+    const size_t n_triples = n / 3;
+    for (size_t p = 0, i = 0; p < n_triples; ++p, i += 3) {
+        dbuf[i + 0] = (float)sbuf[i + 0] * scale_0 + bias_0;
+        dbuf[i + 1] = (float)sbuf[i + 1] * scale_1 + bias_1;
+        dbuf[i + 2] = (float)sbuf[i + 2] * scale_2 + bias_2;
     }
 }
 
@@ -2847,8 +2861,15 @@ private:
 // some of the logic is similar to llava_uhd, but with different hyperparameters and some logic is unique (e.g. grid layout)
 struct lfm2_vl_image_processor {
     // ref: https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B/blob/main/processor_config.json
+    //
+    // Android CPU note: on a 350M-class LFM2-VL with 8-core ARM, each 512-px
+    // tile costs ~5 s (ViT forward) + ~6 s (LLM prompt decode of 256 tokens).
+    // Upstream defaults allow up to 10 tiles, which takes ~100 s per image.
+    // Capping at 4 tiles (2x2) keeps ~80 % of the quality while cutting the
+    // wall ~2.5x. A user can still override image_max_tokens to shrink the
+    // overview branch further.
     static constexpr int   min_tiles            = 2;
-    static constexpr int   max_tiles            = 10;
+    static constexpr int   max_tiles            = 4;
     static constexpr float max_pixels_tolerance = 2.0f;
     static constexpr int   tile_size            = 512;
 

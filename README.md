@@ -13,6 +13,7 @@ JNI bridge
     |
 Engine layer (engine/)
   - GGMLEngine    model load/unload, generation, KV cache, context tracking
+  - ThreadEngine  big.LITTLE-aware thread mode (power_saving / balanced / performance)
   - VLM Engine    vision and audio understanding (20+ architectures)
   - ToolManager   model-agnostic tool calling (JSON, XML, function-call)
   - RAG Engine    late chunking, binary quantized retrieval
@@ -71,6 +72,31 @@ See [docs/BUILD.md](docs/BUILD.md) for full details. Key CMake variables:
 | `GGML_CPU_KLEIDIAI` | ON | ARM KleidiAI micro-kernels |
 | `GGML_LTO` | ON | Link-time optimization |
 | `BUILD_SHARED_LIBS` | OFF | Static link into single .so |
+
+## Thread Modes
+
+The engine reads `/sys/devices/system/cpu/` at runtime to detect big.LITTLE core topology, then configures threads accordingly. Three modes are exposed as a 0–2 integer for a UI seekbar:
+
+| Mode | Value | Behavior |
+|------|-------|----------|
+| Power Saving | 0 | 1 thread, efficiency cores, small batch — minimal battery drain |
+| Balanced | 1 | 2 P-cores gen, all P-cores prompt — default |
+| Performance | 2 | max 4 P-cores gen, all cores prompt, large batch |
+
+Switch at runtime without reloading the model via `ggml_engine_set_thread_mode()`.
+
+## Device & Memory Queries
+
+Before loading a model, query the device to pick an appropriate size:
+
+```c
+ggml_engine_device_info dev = ggml_engine_get_device_info();
+// dev.n_perf_cores, dev.n_efficiency_cores, dev.max_freq_khz
+
+int64_t ram = ggml_engine_available_ram();
+int64_t max_bytes = ggml_engine_max_model_size(ram, /*n_ctx=*/2048);
+// max_bytes = budget after KV cache + 200 MB OS overhead
+```
 
 ## Performance
 

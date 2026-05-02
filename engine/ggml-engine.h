@@ -34,6 +34,7 @@ typedef struct {
     float    rope_freq_base;
     float    rope_freq_scale;
     bool     flash_attn;
+    int32_t  thread_mode; // 0=power_saving, 1=balanced, 2=performance (-1=manual)
 } ggml_engine_params;
 
 typedef struct {
@@ -121,6 +122,16 @@ typedef struct {
     int32_t  generated_tokens;
     double   prompt_tokens_per_sec;
     double   generation_tokens_per_sec;
+
+    // VLM-only breakdown of prompt_eval_ms. Zero when the last call was text-only.
+    //   vlm_tokenize_ms : image preprocess + text tokenization (mtmd_tokenize)
+    //   vlm_encode_ms   : vision/audio encoder forward passes (ViT / conformer)
+    //   vlm_decode_ms   : LLM consuming image/audio embeddings + interleaved text
+    //   vlm_image_tokens: number of image embedding tokens fed to the LLM
+    double   vlm_tokenize_ms;
+    double   vlm_encode_ms;
+    double   vlm_decode_ms;
+    int32_t  vlm_image_tokens;
 } ggml_engine_perf;
 
 ggml_engine_perf    ggml_engine_get_perf(const ggml_engine_t * engine);
@@ -200,6 +211,58 @@ const char *        ggml_engine_vlm_default_marker(void);
 
 bool                ggml_engine_vlm_supports_vision(const ggml_engine_vlm_t * vlm);
 bool                ggml_engine_vlm_supports_audio(const ggml_engine_vlm_t * vlm);
+
+// ── KV Cache Session Save / Load ─────────────────────────────────────────────
+// Saves the full KV cache + conversation position to a binary file.
+// Load restores exactly — same model required. n_past is embedded in the file.
+bool ggml_engine_save_session(ggml_engine_t * engine, const char * path);
+bool ggml_engine_load_session(ggml_engine_t * engine, const char * path);
+
+// ── KV Eviction Policy (StreamingLLM + post-prefill budget) ──────────────────
+//
+// n_sink   : tokens at position [0, n_sink) are NEVER evicted (attention sinks).
+//            Set 0 to disable sink protection. Recommended: 4.
+// n_window : maximum tokens kept from the recent tail. When n_past exceeds
+//            n_sink + n_window, oldest non-sink tokens are dropped and
+//            window positions are shifted to stay contiguous.
+//            Set 0 to disable eviction entirely (default).
+//
+// Eviction is applied:
+//   1. Automatically at the start of each generate call when n_past + prompt > n_ctx
+//   2. After every generated token when n_past >= n_sink + n_window
+//   3. On demand via ggml_engine_evict_to_budget()
+typedef struct {
+    int32_t n_sink;         // tokens to protect at start (attention sinks)
+    int32_t n_window;       // max recency window size (0 = no eviction)
+    bool    evict_at_full;  // auto-evict in generate when context overflows
+} ggml_engine_kv_policy;
+
+ggml_engine_kv_policy ggml_engine_default_kv_policy(void);
+void ggml_engine_set_kv_policy(ggml_engine_t * engine, ggml_engine_kv_policy policy);
+
+// Apply the current policy immediately: drop tokens outside [0,n_sink) ∪ tail window.
+// Call after a long prefill (SnapKV-style prompt budget enforcement).
+void ggml_engine_evict_to_budget(ggml_engine_t * engine);
+
+// Thread engine: mode-based thread management for big.LITTLE SoCs
+// mode: 0=power_saving, 1=balanced, 2=performance
+void ggml_engine_set_thread_mode(ggml_engine_t * engine, int32_t mode);
+
+// Device info query
+typedef struct {
+    int32_t  n_cores_total;
+    int32_t  n_perf_cores;
+    int32_t  n_efficiency_cores;
+    int32_t  max_freq_khz;
+    int32_t  min_freq_khz;
+} ggml_engine_device_info;
+
+ggml_engine_device_info ggml_engine_get_device_info(void);
+
+// Memory-aware helpers
+int64_t ggml_engine_available_ram(void);
+int64_t ggml_engine_max_model_size(int64_t available_ram, int32_t n_ctx);
+int32_t ggml_engine_recommend_batch(int64_t model_size_bytes);
 
 typedef enum {
     TN_ENGINE_LOG_ERROR = 0,

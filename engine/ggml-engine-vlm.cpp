@@ -2,6 +2,7 @@
 #include "vlm/mtmd.h"
 #include "vlm/mtmd-helper.h"
 #include "vlm/clip.h"
+#include "tn-log.h"
 
 #include <sstream>
 #include <cstring>
@@ -92,6 +93,10 @@ ggml_engine_status ggml_engine_vlm_generate(
         return GGML_ENGINE_ERROR_VLM_NO_PROJ;
     }
 
+    if (n_images > 0 && !images) {
+        return GGML_ENGINE_ERROR_VLM_ENCODE;
+    }
+
     engine->cancelled.store(false);
     engine->response.clear();
     memset(&engine->perf, 0, sizeof(engine->perf));
@@ -137,13 +142,48 @@ ggml_engine_status ggml_engine_vlm_generate(
 
     int64_t t_prompt_start = llama_time_us();
 
-    llama_pos new_n_past = 0;
-    int32_t eval_result = mtmd_helper_eval_chunks(
-        vlm->mtmd_ctx, engine->ctx, chunks,
-        0, 0,
-        engine->params.n_batch,
-        true,
-        &new_n_past);
+    // Walk chunks manually so we can separate vision-encode time from LLM
+    // prompt-eval time on image embeddings. The BALANCED log showed this loop
+    // spending almost all of its wall in the decode half, not in mtmd_encode.
+    int64_t t_encode_us = 0;
+    int64_t t_decode_us = 0;
+    int32_t n_image_tokens = 0;
+    llama_pos n_past = 0;
+
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    int32_t eval_result = 0;
+
+    for (size_t i = 0; i < n_chunks && eval_result == 0; i++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+        const bool logits_last = (i == n_chunks - 1);
+        const enum mtmd_input_chunk_type ctype = mtmd_input_chunk_get_type(chunk);
+
+        if (ctype == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            const int64_t t0 = llama_time_us();
+            eval_result = mtmd_helper_eval_chunk_single(
+                vlm->mtmd_ctx, engine->ctx, chunk,
+                n_past, 0, engine->params.n_batch, logits_last, &n_past);
+            t_decode_us += llama_time_us() - t0;
+        } else {
+            // Vision / audio encoder forward pass
+            const int64_t t_enc0 = llama_time_us();
+            eval_result = mtmd_encode_chunk(vlm->mtmd_ctx, chunk);
+            t_encode_us += llama_time_us() - t_enc0;
+
+            if (eval_result != 0) break;
+
+            // LLM consumes the embeddings as an embd-batch
+            float * embd = mtmd_get_output_embd(vlm->mtmd_ctx);
+            const int32_t n_tok = (int32_t)mtmd_input_chunk_get_n_tokens(chunk);
+            n_image_tokens += n_tok;
+
+            const int64_t t_dec0 = llama_time_us();
+            eval_result = mtmd_helper_decode_image_chunk(
+                vlm->mtmd_ctx, engine->ctx, chunk, embd,
+                n_past, 0, engine->params.n_batch, &n_past);
+            t_decode_us += llama_time_us() - t_dec0;
+        }
+    }
 
     mtmd_input_chunks_free(chunks);
 
@@ -151,11 +191,25 @@ ggml_engine_status ggml_engine_vlm_generate(
         return GGML_ENGINE_ERROR_VLM_ENCODE;
     }
 
-    engine->n_past = new_n_past;
+    engine->n_past = n_past;
 
-    int64_t t_prompt_end = llama_time_us();
-    engine->perf.prompt_eval_ms = (t_prompt_end - t_prompt_start) / 1000.0;
-    engine->perf.prompt_tokens = engine->n_past;
+    const int64_t t_prompt_end = llama_time_us();
+    engine->perf.prompt_eval_ms   = (t_prompt_end - t_prompt_start) / 1000.0;
+    engine->perf.prompt_tokens    = engine->n_past;
+    engine->perf.vlm_encode_ms    = t_encode_us / 1000.0;
+    engine->perf.vlm_decode_ms    = t_decode_us / 1000.0;
+    engine->perf.vlm_image_tokens = n_image_tokens;
+    // Anything left over in prompt_eval_ms is tokenize + preprocessing
+    double accounted = engine->perf.vlm_encode_ms + engine->perf.vlm_decode_ms;
+    double remainder = engine->perf.prompt_eval_ms - accounted;
+    engine->perf.vlm_tokenize_ms  = remainder > 0.0 ? remainder : 0.0;
+
+    TN_LOG_INF("VLM stage breakdown: tokenize+preproc=%.1fms  encode=%.1fms  decode=%.1fms  image_tokens=%d  total_prompt_tokens=%d",
+               engine->perf.vlm_tokenize_ms,
+               engine->perf.vlm_encode_ms,
+               engine->perf.vlm_decode_ms,
+               engine->perf.vlm_image_tokens,
+               engine->perf.prompt_tokens);
 
     return ggml_engine_generate_loop(engine, sampling, callback, user_data);
 }

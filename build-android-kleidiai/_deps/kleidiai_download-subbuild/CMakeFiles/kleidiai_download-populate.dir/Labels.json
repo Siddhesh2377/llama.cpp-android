@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/CMakeFiles/kleidiai_download-populate"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/CMakeFiles/kleidiai_download-populate.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/CMakeFiles/kleidiai_download-populate-complete.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-build.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-configure.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-download.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-install.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-patch.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-test.rule"
+		},
+		{
+			"file" : "/home/home/dev/include/llama.cpp/build-android-kleidiai/_deps/kleidiai_download-subbuild/kleidiai_download-populate-prefix/src/kleidiai_download-populate-stamp/kleidiai_download-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"kleidiai_download-populate"
+		],
+		"name" : "kleidiai_download-populate"
+	}
+}
