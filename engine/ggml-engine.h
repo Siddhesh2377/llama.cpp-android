@@ -139,33 +139,6 @@ ggml_engine_perf    ggml_engine_get_perf(const ggml_engine_t * engine);
 // Progress callback: 0.0 to 1.0
 typedef void (*ggml_engine_progress_cb)(float progress, void * user_data);
 
-typedef struct {
-    float *  data;       // n_embd floats, mean hidden state vector
-    int32_t  n_embd;
-    int32_t  n_tokens;
-} ggml_engine_vectors;
-
-// Extract mean hidden state vector (does not touch engine KV cache). Caller must free.
-ggml_engine_vectors * ggml_engine_calc_vectors(
-    ggml_engine_t * engine,
-    const char * prompt,
-    ggml_engine_progress_cb progress,
-    void * user_data
-);
-
-void ggml_engine_free_vectors(ggml_engine_vectors * v);
-
-// Apply control vector uniformly across layers. il_start/il_end: -1 = all layers.
-bool ggml_engine_apply_vectors(
-    ggml_engine_t * engine,
-    const ggml_engine_vectors * vectors,
-    float strength,
-    int32_t il_start,
-    int32_t il_end
-);
-
-void ggml_engine_clear_vectors(ggml_engine_t * engine);
-
 typedef struct ggml_engine_vlm ggml_engine_vlm_t;
 
 typedef struct {

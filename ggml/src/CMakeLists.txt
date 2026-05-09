@@ -445,7 +445,10 @@ elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
 endif()
 
-# Non-CPU backends removed - Android CPU-only build
+# GPU backends restored for Android Adreno/Mali — used selectively for VLM
+# vision encode + long-context prefill. CPU still primary for batch=1 decode.
+ggml_add_backend(Vulkan)
+ggml_add_backend(OpenCL)
 
 foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)

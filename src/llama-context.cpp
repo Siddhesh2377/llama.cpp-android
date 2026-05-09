@@ -1054,19 +1054,6 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     return true;
 }
 
-bool llama_context::set_adapter_cvec(
-            const float * data,
-                 size_t   len,
-                int32_t   n_embd,
-                int32_t   il_start,
-                int32_t   il_end) {
-    LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
-
-    // TODO: should we reserve?
-
-    return cvec->apply(model, data, len, n_embd, il_start, il_end);
-}
-
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -3049,18 +3036,6 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
-}
-
-int32_t llama_set_adapter_cvec(
-        llama_context * ctx,
-          const float * data,
-               size_t   len,
-              int32_t   n_embd,
-              int32_t   il_start,
-              int32_t   il_end) {
-    bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
-
-    return res ? 0 : -1;
 }
 
 //

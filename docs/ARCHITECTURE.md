@@ -8,7 +8,7 @@ Kotlin SDK (com.dark.gguf_lib)
 JNI Bridge (gguf_lib.cpp)
   |
 Engine Layer (engine/)
-  GGMLEngine  |  VLM Engine  |  ToolManager  |  RAG Engine
+  GGMLEngine  |  VLM Engine  |  RAG Engine
   |
 llama.cpp Core (src/)
   Model loading, tokenization, inference, sampling, 100+ architectures
@@ -31,7 +31,6 @@ llama.cpp/
 │   ├── ggml-engine-vlm.cpp       VLM generation (text + images + audio)
 │   ├── ggml-engine-internal.h    Shared structs and generation loop
 │   ├── rag-engine.h/.cpp         RAG: late chunking, binary quantized search, retrieval
-│   ├── tool-manager.h/.cpp       Tool call parsing (JSON/XML/function) and execution
 │   ├── tn-log.h/.cpp             Logging utilities
 │   ├── engine-utils.h            Shared engine helper functions
 │   ├── vlm/                      Vision/audio encoder (mtmd library)
@@ -169,32 +168,6 @@ VLM Engine — ggml_engine_vlm_generate()
   6. Shared generation loop (same as text generation)
 
   Return perf metrics (prompt_eval includes vision encode time)
-```
-
----
-
-## Data Flow: Tool Calling
-
-```
-User message + tool definitions
-    |
-    v
-ToolManager
-
-  1. tool_manager_get_prompt()
-     - Generate tool description text
-     - Inject into system/user prompt
-  2. Engine generates response
-  3. tool_manager_parse_output()
-     - Try JSON parse: {"name": ..., "arguments": ...}
-     - Try XML parse:  <tool_call>...</tool_call>
-     - Try function parse: name(key=value)
-     - Validate against registered tool definitions
-     - Return tool_call_result
-  4. tool_manager_execute()
-     - Invoke registered callback
-     - Return result string
-  5. Feed result back to engine for next turn
 ```
 
 ---

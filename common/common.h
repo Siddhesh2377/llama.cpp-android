@@ -59,8 +59,6 @@ extern const char * LLAMA_BUILD_TARGET;
 
 const static std::string build_info("b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT);
 
-struct common_control_vector_load_info;
-
 //
 // CPU utils
 //
@@ -371,11 +369,7 @@ struct common_params {
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
-    std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
-
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
-    int32_t control_vector_layer_start = -1; // layer range for control vector
-    int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
@@ -810,27 +804,6 @@ std::string common_detokenize(
 void common_embd_normalize(const float * inp, float * out, int n, int embd_norm);
 
 float common_embd_similarity_cos(const float * embd1, const float * embd2, int n);
-
-//
-// Control vector utils
-//
-
-struct common_control_vector_data {
-    int n_embd;
-
-    // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
-    std::vector<float> data;
-};
-
-struct common_control_vector_load_info {
-    float strength;
-
-    std::string fname;
-};
-
-// Load control vectors, scale each by strength, and add them together.
-// On error, returns {-1, empty}
-common_control_vector_data common_control_vector_load(const std::vector<common_control_vector_load_info> & load_infos);
 
 //
 // Split utils

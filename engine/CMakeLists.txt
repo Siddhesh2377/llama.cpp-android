@@ -33,7 +33,7 @@ set(ENGINE_SOURCES
     ggml-engine.cpp
     ggml-engine-vlm.cpp
     rag-engine.cpp
-    tool-manager.cpp
+    vt_cache.cpp
     ${VLM_SOURCES}
 )
 

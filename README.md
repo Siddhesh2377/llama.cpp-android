@@ -15,7 +15,6 @@ Engine layer (engine/)
   - GGMLEngine    model load/unload, generation, KV cache, context tracking
   - ThreadEngine  big.LITTLE-aware thread mode (power_saving / balanced / performance)
   - VLM Engine    vision and audio understanding (20+ architectures)
-  - ToolManager   model-agnostic tool calling (JSON, XML, function-call)
   - RAG Engine    late chunking, binary quantized retrieval
   - Logging       callback-based, routes to Android logcat or custom handler
     |
@@ -33,7 +32,7 @@ src/             llama.cpp model loading, tokenization, inference, sampling
 include/         public C/C++ headers (llama.h, llama-cpp.h)
 ggml/            tensor library, CPU backend only, ARM optimized
 common/          chat templates, JSON schema grammar, sampling, jinja
-engine/          engine layer (ggml-engine, vlm, tool-manager, rag-engine, tn-log)
+engine/          engine layer (ggml-engine, vlm, rag-engine, tn-log)
   vlm/           vision/audio encoders (CLIP, SigLIP, Whisper, 20+ architectures)
 vendor/          nlohmann/json, stb_image, miniaudio
 cmake/           build-info, license, compiler flags
@@ -113,7 +112,7 @@ Tested on Cortex-X3 (armv9, i8mm, bf16, NEON, dotprod):
 
 | Document | Description |
 |----------|-------------|
-| [API Reference](docs/API.md) | C API for GGMLEngine, VLM, ToolManager, RAG, Logging |
+| [API Reference](docs/API.md) | C API for GGMLEngine, VLM, RAG, Logging |
 | [Architecture](docs/ARCHITECTURE.md) | Stack diagram, directory map, data flows |
 | [Build Guide](docs/BUILD.md) | CMake variables, NDK cross-compilation |
 | [Performance](docs/PERFORMANCE.md) | Benchmarks, ARM optimizations, threading |

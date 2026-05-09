@@ -6,7 +6,7 @@ Complete C API reference for the Tool-Neuron engine components. All headers are 
 
 ## GGMLEngine (`ggml-engine.h`)
 
-Core LLM inference engine. Handles model loading, text generation, context management, tokenization, control vectors, VLM support, and thread mode control.
+Core LLM inference engine. Handles model loading, text generation, context management, tokenization, VLM support, and thread mode control.
 
 ### Types
 
@@ -94,16 +94,6 @@ Full context window status.
 | `remaining` | `int32_t` | Total minus used |
 | `prompt_estimate` | `int32_t` | Estimated tokens for pending prompt (-1 if no prompt given) |
 | `after_prompt` | `int32_t` | Remaining after prompt (-1 if no prompt given) |
-
-#### `ggml_engine_vectors`
-
-Mean hidden-state vector extracted from a prompt.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `data` | `float *` | `n_embd` floats |
-| `n_embd` | `int32_t` | Embedding dimension |
-| `n_tokens` | `int32_t` | Number of tokens processed |
 
 #### `ggml_engine_device_info`
 
@@ -242,26 +232,6 @@ int64_t ggml_engine_max_model_size(int64_t available_ram, int32_t n_ctx);
 
 // Recommended n_batch for a given model file size and current free RAM.
 int32_t ggml_engine_recommend_batch(int64_t model_size_bytes);
-```
-
-#### Control Vectors
-
-Extract and apply control vectors (representation engineering) for steering model behavior at the hidden-state level.
-
-```c
-// Extract mean hidden-state vector. Caller must free.
-ggml_engine_vectors * ggml_engine_calc_vectors(
-    ggml_engine_t * engine, const char * prompt,
-    ggml_engine_progress_cb progress, void * user_data);
-
-void ggml_engine_free_vectors(ggml_engine_vectors * v);
-
-// Apply control vector across layers. il_start/il_end = -1 means all layers.
-bool ggml_engine_apply_vectors(
-    ggml_engine_t * engine, const ggml_engine_vectors * vectors,
-    float strength, int32_t il_start, int32_t il_end);
-
-void ggml_engine_clear_vectors(ggml_engine_t * engine);
 ```
 
 #### Performance
@@ -532,163 +502,6 @@ int main() {
 3. **Binary quantization** — floats thresholded to 1-bit. 32x compression. Hamming distance for O(1)-per-bit candidate search.
 4. **Two-stage retrieval** — BQ Hamming finds `top_k` candidates, cosine similarity re-ranks to `top_n` final results.
 5. **Sliding window** — documents longer than model context are processed in overlapping windows with averaged overlap regions.
-
----
-
-## ToolManager (`tool-manager.h`)
-
-Model-agnostic tool calling. Parses tool calls from model output in JSON, XML, and function-call formats. Supports multiple tool calls per response.
-
-### Types
-
-#### `tool_manager_t`
-
-Opaque handle. Created with `tool_manager_create()`, destroyed with `tool_manager_free()`.
-
-#### `tool_param_type`
-
-```c
-typedef enum {
-    TOOL_PARAM_STRING,
-    TOOL_PARAM_NUMBER,
-    TOOL_PARAM_BOOLEAN,
-    TOOL_PARAM_ARRAY,
-    TOOL_PARAM_OBJECT,
-} tool_param_type;
-```
-
-#### `tool_param_def`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `const char *` | Parameter name |
-| `description` | `const char *` | Human-readable description |
-| `type` | `tool_param_type` | Data type |
-| `required` | `bool` | Whether parameter is required for validation |
-
-#### `tool_def`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `const char *` | Tool name |
-| `description` | `const char *` | Tool description shown to model |
-| `params` | `tool_param_def *` | Parameter definitions array |
-| `n_params` | `int32_t` | Number of parameters |
-
-#### `tool_call_result`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `tool_name` | `const char *` | Name of parsed tool (heap-allocated) |
-| `arguments_json` | `const char *` | JSON string of arguments (heap-allocated) |
-| `is_valid` | `bool` | true if parsing and validation succeeded |
-
-Both `tool_name` and `arguments_json` must be freed. Use `tool_manager_free_results()` for arrays, or `free()` for the single-result case.
-
-#### `tool_execute_callback`
-
-```c
-typedef const char * (*tool_execute_callback)(
-    const char * tool_name, const char * args_json, void * user_data);
-```
-
-The returned string is owned by the caller and will not be freed by the engine.
-
-### Functions
-
-```c
-// Lifecycle
-tool_manager_t * tool_manager_create(void);
-void             tool_manager_free(tool_manager_t * tm);
-
-// Registration
-void tool_manager_register(tool_manager_t * tm, const tool_def * tool);
-void tool_manager_clear(tool_manager_t * tm);
-
-// System prompt. Caller must free with tool_manager_free_string.
-char * tool_manager_get_prompt(const tool_manager_t * tm);
-
-// Parse first valid tool call from model output.
-// result.is_valid == false if no tool call found.
-tool_call_result tool_manager_parse_output(
-    const tool_manager_t * tm, const char * model_output);
-
-// Parse all valid tool calls. Returns NULL if none found.
-// Caller must free with tool_manager_free_results.
-tool_call_result * tool_manager_parse_output_all(
-    const tool_manager_t * tm, const char * model_output,
-    int32_t * n_calls);
-void tool_manager_free_results(tool_call_result * results, int32_t n_calls);
-
-// Execute a parsed call via the registered callback. Caller must free result string.
-void   tool_manager_set_callback(tool_manager_t * tm,
-           tool_execute_callback cb, void * user_data);
-char * tool_manager_execute(tool_manager_t * tm, const tool_call_result * call);
-
-void tool_manager_free_string(char * str);
-```
-
-### Supported Formats
-
-**JSON (OpenAI-style)**
-```json
-{"tool": "get_weather", "arguments": {"city": "Tokyo"}}
-```
-
-Also accepts `"name"` and `"function"` as alternate keys for the tool name, and `"params"` / `"parameters"` as alternate keys for arguments.
-
-**XML**
-```xml
-<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>
-```
-
-**Function-call**
-```
-get_weather({"city": "Tokyo"})
-```
-
-### Usage Example
-
-```c
-#include "tool-manager.h"
-
-tool_param_def weather_params[] = {
-    { "city", "City name", TOOL_PARAM_STRING, true },
-};
-tool_def weather_tool = {
-    .name = "get_weather",
-    .description = "Get current weather for a city.",
-    .params = weather_params, .n_params = 1,
-};
-
-const char * execute(const char * name, const char * args, void * user) {
-    return "{\"temp\": 22, \"condition\": \"sunny\"}";
-}
-
-int main() {
-    tool_manager_t * tm = tool_manager_create();
-    tool_manager_register(tm, &weather_tool);
-    tool_manager_set_callback(tm, execute, NULL);
-
-    // Inject into system prompt
-    char * sys_prompt = tool_manager_get_prompt(tm);
-    // ... pass sys_prompt to engine ...
-    tool_manager_free_string(sys_prompt);
-
-    // Parse model output
-    const char * output = "{\"tool\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}";
-    tool_call_result result = tool_manager_parse_output(tm, output);
-    if (result.is_valid) {
-        char * response = tool_manager_execute(tm, &result);
-        printf("Result: %s\n", response);
-        tool_manager_free_string(response);
-        free((void *)result.tool_name);
-        free((void *)result.arguments_json);
-    }
-
-    tool_manager_free(tm);
-}
-```
 
 ---
 
