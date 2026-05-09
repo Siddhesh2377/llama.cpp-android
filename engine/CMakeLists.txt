@@ -34,6 +34,7 @@ set(ENGINE_SOURCES
     ggml-engine-vlm.cpp
     rag-engine.cpp
     vt_cache.cpp
+    vlm_kv_cache.cpp
     ${VLM_SOURCES}
 )
 

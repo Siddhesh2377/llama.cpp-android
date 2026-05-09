@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 //
@@ -211,13 +212,42 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
+        // GPU backends — for layers stored on GPU (n_gpu_layers > 0)
         for (auto * dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // Compute-only GPU/IGPU backends — registered as additional compute
+        // targets even when no layer weights live on them. ggml_backend_sched +
+        // op_offload then dispatches large ops (batch ≥ Vulkan's threshold,
+        // default 32) to GPU while keeping single-token decode on CPU. Net:
+        // prefill speedup with no decode regression. Only fires when the host
+        // opted into op_offload AND the device isn't already registered above.
+        if (cparams.op_offload) {
+            std::set<ggml_backend_dev_t> already_added(model.devices.begin(), model.devices.end());
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (!dev) continue;
+                const auto t = ggml_backend_dev_type(dev);
+                if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    continue;
+                }
+                if (already_added.count(dev)) continue;
+
+                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend == nullptr) {
+                    LLAMA_LOG_WARN("%s: compute-offload: failed to init %s backend (skipping)\n",
+                                   __func__, ggml_backend_dev_name(dev));
+                    continue;
+                }
+                LLAMA_LOG_INFO("%s: compute-offload: registered %s as compute target\n",
+                               __func__, ggml_backend_dev_name(dev));
+                backends.emplace_back(backend);
+            }
         }
 
         // add ACCEL backends (such as BLAS)
