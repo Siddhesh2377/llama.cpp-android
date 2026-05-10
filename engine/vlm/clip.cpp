@@ -158,15 +158,18 @@ struct clip_ctx {
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
+    // GPU backend the sched is allowed to offload to. Owned separately from
+    // backend (which always points at CPU). Null when use_gpu=false or no GPU
+    // device was registered with ggml at startup.
+    ggml_backend_t backend_gpu = nullptr;
+
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        // CPU-only: no GPU backend
         backend = backend_cpu;
-        LOG_INF("%s: CLIP using CPU backend\n", __func__);
 
         if (ctx_params.image_min_tokens > 0) {
             model.hparams.custom_image_min_tokens = ctx_params.image_min_tokens;
@@ -175,6 +178,53 @@ struct clip_ctx {
             model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
         }
 
+        // Try to register a GPU/IGPU backend as an op-offload target when the
+        // caller asked for use_gpu=true. The CPU stays as the *primary*
+        // backend (last in the list, where the sched parks weight-resident
+        // ops). When a GPU is available, we prepend it so ggml_backend_sched
+        // sees it as a higher-priority compute target — combined with
+        // op_offload=true (the last arg to sched_new), large GEMMs in the
+        // ViT graph get dispatched there while the CPU keeps anything the
+        // GPU doesn't support.
+        //
+        // Failure to init the GPU backend is non-fatal — we log and stay
+        // CPU-only. This guards against missing libvulkan, unsupported
+        // device, or vendor driver bugs that surface at backend init time.
+        if (ctx_params.use_gpu) {
+            ggml_backend_dev_t gpu_dev = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (!d) continue;
+                const auto t = ggml_backend_dev_type(d);
+                if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    gpu_dev = d;
+                    break;
+                }
+            }
+            if (gpu_dev) {
+                ggml_backend_t b = ggml_backend_dev_init(gpu_dev, nullptr);
+                if (b) {
+                    backend_gpu = b;
+                    LOG_INF("%s: CLIP using %s + CPU\n", __func__, ggml_backend_dev_name(gpu_dev));
+                } else {
+                    LOG_WRN("%s: CLIP: %s init failed, falling back to CPU\n",
+                            __func__, ggml_backend_dev_name(gpu_dev));
+                }
+            }
+        }
+
+        if (!backend_gpu) {
+            LOG_INF("%s: CLIP using CPU backend\n", __func__);
+        }
+
+        // Order matters: sched picks the first backend that supports an op.
+        // GPU first → op_offload routes large ops there. CPU last → catches
+        // everything the GPU can't handle (and stays the home for weight
+        // tensors, since clip_ctx allocates them through the CPU buft).
+        if (backend_gpu) {
+            backend_ptrs.push_back(backend_gpu);
+            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_gpu));
+        }
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
@@ -188,9 +238,10 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
-        ggml_backend_free(backend);
-        if (backend != backend_cpu) {
-            ggml_backend_free(backend_cpu);
+        // backend == backend_cpu by construction; we own backend_gpu separately.
+        ggml_backend_free(backend_cpu);
+        if (backend_gpu) {
+            ggml_backend_free(backend_gpu);
         }
     }
 
@@ -1881,7 +1932,17 @@ struct clip_model_loader {
             }
 
             // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+            //
+            // Pick the buffer type based on whether a GPU backend is registered.
+            // When backend_gpu exists (use_gpu=true and a Vulkan/etc device was
+            // available at init), allocate weights directly on the GPU buft so
+            // the sched routes weight-touching ops to GPU naturally with splits
+            // only at I/O boundaries. Without this, op_offload bounces every
+            // weight-touching op CPU↔GPU per layer, producing hundreds of tiny
+            // queue submissions that overwhelm mobile GPU drivers (Adreno 810
+            // has been observed to TDR with vk::DeviceLostError under that load).
+            ggml_backend_t weight_backend = ctx_clip.backend_gpu ? ctx_clip.backend_gpu : ctx_clip.backend;
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(weight_backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             for (auto & t : tensors_to_load) {
