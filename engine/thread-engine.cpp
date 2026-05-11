@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cstring>
 
 #ifdef __ANDROID__
 #include <sys/sysinfo.h>
@@ -65,7 +66,6 @@ tn_device_info tn_detect_device(void) {
     tn_device_info info = {};
 
 #if defined(__linux__) || defined(__ANDROID__)
-    // Count total cores
     DIR * dir = opendir("/sys/devices/system/cpu");
     if (!dir) {
         info.n_cores_total = 1;
@@ -127,6 +127,17 @@ tn_device_info tn_detect_device(void) {
     return info;
 }
 
+// Build a ggml-style cpumask (bool per CPU) from a list of core IDs. Out-of-
+// range IDs are silently dropped — there is no diagnostic value in failing
+// because the calling code already logs the per-mode summary line.
+static void fill_cpumask(bool * mask, const int32_t * ids, int n_ids) {
+    std::memset(mask, 0, sizeof(bool) * TN_MAX_CPUS);
+    for (int i = 0; i < n_ids; i++) {
+        int c = (int)ids[i];
+        if (c >= 0 && c < TN_MAX_CPUS) mask[c] = true;
+    }
+}
+
 tn_thread_config tn_thread_config_for_mode(tn_thread_mode mode) {
     tn_thread_config cfg = {};
     tn_device_info dev = tn_detect_device();
@@ -177,70 +188,103 @@ tn_thread_config tn_thread_config_for_mode(tn_thread_mode mode) {
 
     // np = TRUE perf cluster count (post cluster-classification). On modern
     // big.LITTLE SoCs this is typically 4 (e.g. Snapdragon 7s Gen 3:
-    // 4× A720 perf + 4× A520 eff). For BALANCED we keep work on the perf
-    // cluster only — ggml's parallel kernels are pace-bound by the slowest
-    // thread, and the eff cores are 25–40% slower per cycle PLUS share less
-    // L2/L3 cache. Mixing them in BALANCED hurts. PERFORMANCE deliberately
-    // pulls in eff cores — see comment in that case below.
+    // 4× A720 perf + 4× A520 eff). ne = eff cluster count.
     int np      = cfg.n_perf_core_ids > 0 ? cfg.n_perf_core_ids : dev.n_cores_total;
+    int ne      = cfg.n_efficiency_core_ids;
     int n_total = dev.n_cores_total > 0 ? dev.n_cores_total : 4;
     if (np <= 0) np = 4;
 
+    // Default knobs shared across modes. Polling=0 because we always block on
+    // user input between decodes — busy-spinning burns battery for nothing.
+    cfg.poll = 0;
+
     switch (mode) {
         case TN_THREAD_POWER_SAVING:
-            // 1 thread for decode, 2 for batch, run on eff cores (no pinning).
+            // Pin to the efficiency cluster (A520 on 7s Gen 3 etc). Single
+            // decode thread, two batch threads, small n_batch. The defining
+            // property here is *not* speed — it's predictable low power draw
+            // even under sustained generation. Without pinning the Android
+            // scheduler will happily run "low power" workloads on the prime
+            // core whenever it's not contended, leaking power vs PERFORMANCE.
             cfg.n_threads_generation = 1;
-            cfg.n_threads_batch = std::max(1,
-                cfg.n_efficiency_core_ids > 0 ? std::min(2, cfg.n_efficiency_core_ids) : 2);
-            cfg.n_batch = 128;
-            cfg.pin_to_perf_cores = false;
+            cfg.n_threads_batch      = ne > 0 ? std::min(2, ne) : std::min(2, np);
+            cfg.n_batch              = 128;
+            cfg.pin_to_perf_cores    = false;
+            cfg.pin_to_eff_cores     = (ne > 0);
+            cfg.priority             = TN_PRIO_LOW;
+            if (ne > 0) {
+                fill_cpumask(cfg.cpumask_generation,
+                             cfg.efficiency_core_ids, ne);
+                fill_cpumask(cfg.cpumask_batch,
+                             cfg.efficiency_core_ids, ne);
+            }
             break;
 
         case TN_THREAD_BALANCED:
-            // Decode is memory-bandwidth-bound + shared-L3 sensitive.
-            // Two empirically-validated rules on Snapdragon 7s Gen 3:
-            //   1. gen=2 beats gen=4. More threads thrash L3 — LFM-350M
-            //      Q4_K_M went from 38 → 28 tk/s when we bumped to 4.
-            //   2. pin=false beats pin-to-perf-cluster. The big.LITTLE-
-            //      aware Android scheduler picks the natural prime + 1-perf
-            //      pair for active decode threads; explicit affinity
-            //      restricting to all 4 perf cores leaves the scheduler
-            //      with worse placement choices and also occasionally
-            //      EINVALs when the cpuset controller restricts the
-            //      foreground service to a subset.
+            // Pin to the perf cluster. Two decode threads — empirically the
+            // sweet spot on shared-L3 perf clusters (gen=4 thrashes L3, gen=1
+            // leaves bandwidth on the table on 7s Gen 3 / 8 Gen 1+).
+            //
+            // With explicit pinning we get the same throughput as the lucky-
+            // placement case but eliminate the variance that made POWER_SAVING
+            // sometimes match PERFORMANCE on the same prompt — the kernel was
+            // randomly placing decode threads on the eff cluster.
+            //
+            // n_batch=512: prompt eval is dominated by graph build / scheduler
+            // overhead at small batches; doubling n_batch from 256 halves
+            // those calls and improves prompt-eval throughput on small models.
             cfg.n_threads_generation = std::min(2, np);
             cfg.n_threads_batch      = np;
-            // Bumped from 256: VLM image-embedding prompt eval is dominated by
-            // the number of llama_decode calls, each of which pays the graph
-            // build / scheduler overhead. Doubling n_batch halves those calls
-            // and measurably improves image-token prompt-eval throughput on
-            // 350M–1B models. Extra KV-compute buffer cost is <100 MiB.
-            cfg.n_batch = 512;
-            cfg.pin_to_perf_cores = false;
+            cfg.n_batch              = 512;
+            cfg.pin_to_perf_cores    = true;
+            cfg.pin_to_eff_cores     = false;
+            cfg.priority             = TN_PRIO_NORMAL;
+            fill_cpumask(cfg.cpumask_generation, cfg.perf_core_ids, np);
+            fill_cpumask(cfg.cpumask_batch,      cfg.perf_core_ids, np);
             break;
 
         case TN_THREAD_PERFORMANCE:
-            // PERFORMANCE differs from BALANCED only on the batch axis —
-            // not the decode axis. Pure decode is memory-bandwidth-bound
-            // and gen=2 is the sweet spot on shared-L3 perf clusters
-            // regardless of mode (see BALANCED comment). Where PERFORMANCE
-            // actually helps is prompt eval and image-prefill: those are
-            // compute-bound so we widen the threadpool to every core
-            // (incl. eff cluster — eff cores at 78% of perf still
-            // contribute meaningfully to compute-bound parallel-for) and
-            // bump n_batch to 1024 to halve graph-build overhead on long
-            // prompts. No pin — kernel can spread across all 8 cores so
-            // memory transactions on different cores overlap.
-            cfg.n_threads_generation = std::min(2, np);
+            // Same pinning as BALANCED but pushes decode to 3 threads on the
+            // perf cluster. The third A720 contributes meaningfully on small
+            // models (<1B) where bandwidth isn't yet saturated. On larger
+            // models the extra thread plateaus but doesn't hurt because we're
+            // still inside the perf cluster's shared L3. Priority HIGH so the
+            // OS won't deprioritize us when the screen is on but the foreground
+            // app isn't us (we're a foreground service).
+            //
+            // n_threads_batch = n_total: prompt eval is compute-bound, all
+            // cores including eff contribute. n_batch=1024 halves graph-build
+            // overhead on long prompts.
+            cfg.n_threads_generation = std::min(3, np);
             cfg.n_threads_batch      = n_total;
             cfg.n_batch              = 1024;
-            cfg.pin_to_perf_cores    = false;
+            cfg.pin_to_perf_cores    = true;
+            cfg.pin_to_eff_cores     = false;
+            cfg.priority             = TN_PRIO_HIGH;
+            fill_cpumask(cfg.cpumask_generation, cfg.perf_core_ids, np);
+            // Batch mask covers ALL online cores. We build it from the union
+            // of perf + eff core IDs rather than indexing 0..n_total because
+            // some devices skip CPU IDs (offline cores, hotplug holes).
+            {
+                std::memset(cfg.cpumask_batch, 0, sizeof(cfg.cpumask_batch));
+                for (int i = 0; i < np; i++) {
+                    int c = (int)cfg.perf_core_ids[i];
+                    if (c >= 0 && c < TN_MAX_CPUS) cfg.cpumask_batch[c] = true;
+                }
+                for (int i = 0; i < ne; i++) {
+                    int c = (int)cfg.efficiency_core_ids[i];
+                    if (c >= 0 && c < TN_MAX_CPUS) cfg.cpumask_batch[c] = true;
+                }
+            }
             break;
     }
 
-    TN_LOG_INF("thread mode %d: gen=%d batch=%d n_batch=%d pin=%d",
+    TN_LOG_INF("thread mode %d: gen=%d batch=%d n_batch=%d pin=%s prio=%d",
                (int)mode, cfg.n_threads_generation, cfg.n_threads_batch,
-               cfg.n_batch, cfg.pin_to_perf_cores);
+               cfg.n_batch,
+               cfg.pin_to_perf_cores ? "perf" :
+               (cfg.pin_to_eff_cores ? "eff" : "none"),
+               (int)cfg.priority);
 
     return cfg;
 }
