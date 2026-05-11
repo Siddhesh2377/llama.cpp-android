@@ -30,6 +30,7 @@ set(VLM_SOURCES
 set(ENGINE_SOURCES
     tn-log.cpp
     thread-engine.cpp
+    power-engine.cpp
     ggml-engine.cpp
     ggml-engine-vlm.cpp
     rag-engine.cpp
