@@ -40,6 +40,27 @@ static bool core_is_online(int cpu_id) {
     return read_sysfs_int(path) == 1;
 }
 
+// Cluster-based classification: groups cores by max frequency, treats the
+// fastest cluster (and any within 5% of it) as "perf". Replaces the old
+// 70%-of-max threshold which misclassified Cortex-A520 eff cores on
+// Snapdragon 7s Gen 3 / 7+ Gen 3 as perf (eff @ 1.95 GHz / prime @ 2.5 GHz
+// = 78%, above 70%, wrong cluster).
+//
+// "Perf" = top frequency cluster. "Eff" = everything else.
+static int classify_perf_count(const int * freqs, int n) {
+    if (n <= 0) return 0;
+    int max_freq = 0;
+    for (int i = 0; i < n; i++) if (freqs[i] > max_freq) max_freq = freqs[i];
+    if (max_freq <= 0) return n;
+    // 5% jitter tolerance — same-cluster cores can drift slightly.
+    const int cluster_threshold = (int)(max_freq * 0.95);
+    int n_perf = 0;
+    for (int i = 0; i < n; i++) {
+        if (freqs[i] >= cluster_threshold) n_perf++;
+    }
+    return n_perf;
+}
+
 tn_device_info tn_detect_device(void) {
     tn_device_info info = {};
 
@@ -72,7 +93,6 @@ tn_device_info tn_detect_device(void) {
 
     info.n_cores_total = n_cores;
 
-    // Find max and min frequencies
     int max_freq = 0, min_freq = 0x7FFFFFFF;
     for (int i = 0; i < n_cores; i++) {
         if (freqs[i] > 0) {
@@ -83,13 +103,8 @@ tn_device_info tn_detect_device(void) {
     info.max_freq_khz = max_freq;
     info.min_freq_khz = min_freq;
 
-    // Classify cores: anything above 70% of max is a performance core
-    int threshold = max_freq > 0 ? (int)(max_freq * 0.70) : 0;
-    int n_perf = 0, n_eff = 0;
-    for (int i = 0; i < n_cores; i++) {
-        if (freqs[i] >= threshold) n_perf++;
-        else n_eff++;
-    }
+    int n_perf = classify_perf_count(freqs, n_cores);
+    int n_eff  = n_cores - n_perf;
 
     info.n_perf_cores = n_perf;
     info.n_efficiency_cores = n_eff;
@@ -142,11 +157,12 @@ tn_thread_config tn_thread_config_for_mode(tn_thread_mode mode) {
         return a.freq > b.freq;
     });
 
-    // Classify using 70% threshold
-    int threshold = n > 0 ? (int)(cores[0].freq * 0.70) : 0;
+    // Cluster-based: top frequency tier (within 5% of max) is "perf";
+    // everything else is "eff". See classify_perf_count() for rationale.
+    const int cluster_threshold = n > 0 ? (int)(cores[0].freq * 0.95) : 0;
     int n_perf = 0, n_eff = 0;
     for (int i = 0; i < n; i++) {
-        if (cores[i].freq >= threshold && n_perf < 16) {
+        if (cores[i].freq >= cluster_threshold && n_perf < 16) {
             cfg.perf_core_ids[n_perf++] = cores[i].id;
         } else if (n_eff < 16) {
             cfg.efficiency_core_ids[n_eff++] = cores[i].id;
@@ -159,35 +175,66 @@ tn_thread_config tn_thread_config_for_mode(tn_thread_mode mode) {
     cfg.n_efficiency_core_ids = 0;
 #endif
 
-    int np = cfg.n_perf_core_ids > 0 ? cfg.n_perf_core_ids : dev.n_cores_total;
+    // np = TRUE perf cluster count (post cluster-classification). On modern
+    // big.LITTLE SoCs this is typically 4 (e.g. Snapdragon 7s Gen 3:
+    // 4× A720 perf + 4× A520 eff). For BALANCED we keep work on the perf
+    // cluster only — ggml's parallel kernels are pace-bound by the slowest
+    // thread, and the eff cores are 25–40% slower per cycle PLUS share less
+    // L2/L3 cache. Mixing them in BALANCED hurts. PERFORMANCE deliberately
+    // pulls in eff cores — see comment in that case below.
+    int np      = cfg.n_perf_core_ids > 0 ? cfg.n_perf_core_ids : dev.n_cores_total;
     int n_total = dev.n_cores_total > 0 ? dev.n_cores_total : 4;
+    if (np <= 0) np = 4;
 
     switch (mode) {
         case TN_THREAD_POWER_SAVING:
-            // Use 1-2 efficiency cores, small batch
+            // 1 thread for decode, 2 for batch, run on eff cores (no pinning).
             cfg.n_threads_generation = 1;
-            cfg.n_threads_batch = std::max(1, cfg.n_efficiency_core_ids > 0 ? cfg.n_efficiency_core_ids : 2);
+            cfg.n_threads_batch = std::max(1,
+                cfg.n_efficiency_core_ids > 0 ? std::min(2, cfg.n_efficiency_core_ids) : 2);
             cfg.n_batch = 128;
             cfg.pin_to_perf_cores = false;
             break;
 
         case TN_THREAD_BALANCED:
+            // Decode is memory-bandwidth-bound + shared-L3 sensitive.
+            // Two empirically-validated rules on Snapdragon 7s Gen 3:
+            //   1. gen=2 beats gen=4. More threads thrash L3 — LFM-350M
+            //      Q4_K_M went from 38 → 28 tk/s when we bumped to 4.
+            //   2. pin=false beats pin-to-perf-cluster. The big.LITTLE-
+            //      aware Android scheduler picks the natural prime + 1-perf
+            //      pair for active decode threads; explicit affinity
+            //      restricting to all 4 perf cores leaves the scheduler
+            //      with worse placement choices and also occasionally
+            //      EINVALs when the cpuset controller restricts the
+            //      foreground service to a subset.
             cfg.n_threads_generation = std::min(2, np);
-            cfg.n_threads_batch = np;
+            cfg.n_threads_batch      = np;
             // Bumped from 256: VLM image-embedding prompt eval is dominated by
             // the number of llama_decode calls, each of which pays the graph
             // build / scheduler overhead. Doubling n_batch halves those calls
             // and measurably improves image-token prompt-eval throughput on
             // 350M–1B models. Extra KV-compute buffer cost is <100 MiB.
             cfg.n_batch = 512;
-            cfg.pin_to_perf_cores = true;
+            cfg.pin_to_perf_cores = false;
             break;
 
         case TN_THREAD_PERFORMANCE:
-            cfg.n_threads_generation = std::min(4, np);
-            cfg.n_threads_batch = n_total;
-            cfg.n_batch = 1024;
-            cfg.pin_to_perf_cores = true;
+            // PERFORMANCE differs from BALANCED only on the batch axis —
+            // not the decode axis. Pure decode is memory-bandwidth-bound
+            // and gen=2 is the sweet spot on shared-L3 perf clusters
+            // regardless of mode (see BALANCED comment). Where PERFORMANCE
+            // actually helps is prompt eval and image-prefill: those are
+            // compute-bound so we widen the threadpool to every core
+            // (incl. eff cluster — eff cores at 78% of perf still
+            // contribute meaningfully to compute-bound parallel-for) and
+            // bump n_batch to 1024 to halve graph-build overhead on long
+            // prompts. No pin — kernel can spread across all 8 cores so
+            // memory transactions on different cores overlap.
+            cfg.n_threads_generation = std::min(2, np);
+            cfg.n_threads_batch      = n_total;
+            cfg.n_batch              = 1024;
+            cfg.pin_to_perf_cores    = false;
             break;
     }
 
