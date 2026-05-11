@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <functional>
 
 #ifdef __ANDROID__
 #include <sys/sysinfo.h>
@@ -41,25 +42,42 @@ static bool core_is_online(int cpu_id) {
     return read_sysfs_int(path) == 1;
 }
 
-// Cluster-based classification: groups cores by max frequency, treats the
-// fastest cluster (and any within 5% of it) as "perf". Replaces the old
-// 70%-of-max threshold which misclassified Cortex-A520 eff cores on
-// Snapdragon 7s Gen 3 / 7+ Gen 3 as perf (eff @ 1.95 GHz / prime @ 2.5 GHz
-// = 78%, above 70%, wrong cluster).
+// Largest-gap cluster classification. Input must be sorted DESCENDING.
+// Finds the largest %-drop between adjacent cores and splits there:
+// everything above the drop = perf, below = eff. If the largest drop is
+// below MIN_CLUSTER_GAP, the device is treated as a single uniform tier
+// (no big.LITTLE split — all cores are perf).
 //
-// "Perf" = top frequency cluster. "Eff" = everything else.
-static int classify_perf_count(const int * freqs, int n) {
-    if (n <= 0) return 0;
-    int max_freq = 0;
-    for (int i = 0; i < n; i++) if (freqs[i] > max_freq) max_freq = freqs[i];
-    if (max_freq <= 0) return n;
-    // 5% jitter tolerance — same-cluster cores can drift slightly.
-    const int cluster_threshold = (int)(max_freq * 0.95);
-    int n_perf = 0;
-    for (int i = 0; i < n; i++) {
-        if (freqs[i] >= cluster_threshold) n_perf++;
+// Replaces the old 5%-of-max threshold which only caught the very top
+// frequency tier and misclassified sub-perf cores on devices that have a
+// prime+perf split inside the big cluster. Exynos 1580 (Samsung A56):
+// 1× A720 @ 2.91 GHz + 3× A720 @ 2.6 GHz + 4× A520 @ 1.95 GHz — old
+// classifier returned n_perf=1 (only the prime), starving inference to
+// a single decode thread (~1 tok/s on 4B q3 vs the ~5 tok/s the perf
+// cluster can sustain). Largest gap is 2.6→1.95 (25%), well above the
+// 11% intra-perf-cluster gap, so the new classifier splits correctly at 4.
+//
+// Also handles Tensor G3 (Pixel 8: prime+perf+eff three-tier) and
+// SD 8 Gen 3 (X4 prime + A720 sub-perf + A520 eff) — both have an
+// intra-perf-cluster drop smaller than the perf→eff drop.
+static constexpr double MIN_CLUSTER_GAP = 0.15;
+
+static int classify_perf_split(const int * freqs_desc, int n) {
+    if (n <= 1) return n;
+    if (freqs_desc[0] <= 0) return n;
+    int best_split = -1;
+    double best_drop = 0.0;
+    for (int i = 1; i < n; i++) {
+        if (freqs_desc[i] <= 0 || freqs_desc[i - 1] <= 0) continue;
+        double drop = (double)(freqs_desc[i - 1] - freqs_desc[i]) /
+                      (double)freqs_desc[i - 1];
+        if (drop > best_drop) {
+            best_drop = drop;
+            best_split = i;
+        }
     }
-    return n_perf;
+    if (best_split < 0 || best_drop < MIN_CLUSTER_GAP) return n;
+    return best_split;
 }
 
 tn_device_info tn_detect_device(void) {
@@ -103,7 +121,10 @@ tn_device_info tn_detect_device(void) {
     info.max_freq_khz = max_freq;
     info.min_freq_khz = min_freq;
 
-    int n_perf = classify_perf_count(freqs, n_cores);
+    int sorted_freqs[64];
+    std::memcpy(sorted_freqs, freqs, sizeof(int) * n_cores);
+    std::sort(sorted_freqs, sorted_freqs + n_cores, std::greater<int>());
+    int n_perf = classify_perf_split(sorted_freqs, n_cores);
     int n_eff  = n_cores - n_perf;
 
     info.n_perf_cores = n_perf;
@@ -168,12 +189,13 @@ tn_thread_config tn_thread_config_for_mode(tn_thread_mode mode) {
         return a.freq > b.freq;
     });
 
-    // Cluster-based: top frequency tier (within 5% of max) is "perf";
-    // everything else is "eff". See classify_perf_count() for rationale.
-    const int cluster_threshold = n > 0 ? (int)(cores[0].freq * 0.95) : 0;
+    // Largest-gap split (see classify_perf_split). cores[] is sorted desc.
+    int freqs_only[64] = {};
+    for (int i = 0; i < n; i++) freqs_only[i] = cores[i].freq;
+    const int n_perf_target = classify_perf_split(freqs_only, n);
     int n_perf = 0, n_eff = 0;
     for (int i = 0; i < n; i++) {
-        if (cores[i].freq >= cluster_threshold && n_perf < 16) {
+        if (i < n_perf_target && n_perf < 16) {
             cfg.perf_core_ids[n_perf++] = cores[i].id;
         } else if (n_eff < 16) {
             cfg.efficiency_core_ids[n_eff++] = cores[i].id;
