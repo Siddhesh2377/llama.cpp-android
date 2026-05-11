@@ -128,6 +128,7 @@ struct mtmd_context {
     int n_threads;
     std::string media_marker;
     const int n_embd_text;
+    llama_rope_type decoder_rope; // upstream PR #22161 — drives mtmd_decode_use_mrope
 
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
@@ -163,7 +164,8 @@ struct mtmd_context {
         print_timings(ctx_params.print_timings),
         n_threads    (ctx_params.n_threads),
         media_marker (ctx_params.media_marker),
-        n_embd_text  (llama_model_n_embd_inp(text_model))
+        n_embd_text  (llama_model_n_embd_inp(text_model)),
+        decoder_rope (llama_model_rope_type(text_model))
     {
         if (std::string(ctx_params.image_marker) != MTMD_DEFAULT_IMAGE_MARKER) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
@@ -889,6 +891,14 @@ bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
 }
 
 bool mtmd_decode_use_mrope(mtmd_context * ctx) {
+    // Upstream PR #22161 — derive from text-model rope type so new VL models
+    // (qwen3-asr etc.) work without an explicit projector switch entry.
+    // Keep the projector-type fallback as a safety net for cases where the
+    // text-model gguf metadata is missing the rope-type field.
+    if (ctx->decoder_rope == LLAMA_ROPE_TYPE_MROPE ||
+        ctx->decoder_rope == LLAMA_ROPE_TYPE_IMROPE) {
+        return true;
+    }
     switch (ctx->proj_type_v()) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
