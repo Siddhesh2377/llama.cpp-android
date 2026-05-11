@@ -8853,7 +8853,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
             } break;
         default:
-            GGML_ABORT("fatal error");
+            // Upstream PR #22742 — surface a clean error to callers instead
+            // of aborting the whole process when the user loads a gguf with
+            // an architecture this build doesn't support yet.
+            throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
 
     // add on pooling layer
