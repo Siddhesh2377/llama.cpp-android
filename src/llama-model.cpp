@@ -4557,7 +4557,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
                         const int64_t n_head      = hparams.n_head(i);
-                        const int64_t n_embd_head = hparams.n_embd_head_k(i);
+                        const int64_t n_embd_head = hparams.n_embd_head_k_il(i);
                         const int64_t n_embd_k    = hparams.n_embd_k_gqa(i);
                         const int64_t n_embd_v    = hparams.n_embd_v_gqa(i);
                         const int     kv_flags    = hparams.has_kv(i) ? 0 : TENSOR_NOT_REQUIRED;

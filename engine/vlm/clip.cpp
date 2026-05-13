@@ -868,7 +868,11 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             } break;
         case PROJECTOR_TYPE_GEMMA4V:
             {
-                builder = std::make_unique<clip_graph_gemma4v>(ctx, img);
+                // Gemma 4 vision projector — the dedicated clip_graph_gemma4v
+                // builder needs upstream's virtual build_mm() in clip_graph,
+                // which this fork doesn't carry yet. Reject cleanly until the
+                // VLM stack catches up; text-only gemma4 still works.
+                throw std::runtime_error("Gemma 4 vision projector not supported in this build");
             } break;
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
@@ -1261,13 +1265,15 @@ struct clip_model_loader {
 
                 case PROJECTOR_TYPE_GEMMA4V:
                     {
+                        // Gemma 4 vision hparams need image_resize_algo /
+                        // RESIZE_ALGO_BILINEAR fields that aren't in this
+                        // fork's clip_hparams yet. Text-only gemma4 works;
+                        // VLM gemma4 is rejected at clip-graph build above.
                         hparams.rope_theta = 100.0f;
-                        hparams.n_merge = 3; // pooling_kernel_size
-                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        hparams.n_merge = 3;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
-                        // @ngxson : the model performs quite poor with small images, we need to bump minimum image tokens to 40 to avoid that
                         hparams.set_limit_image_tokens(252, 280);
-                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        hparams.set_warmup_n_tokens(256);
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA3NV:

@@ -47,6 +47,13 @@ struct llama_hparams {
     uint32_t n_rot;
     uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
+
+    // SWA-layer-specific key/value dims. Gemma 4 (and later models) have
+    // different head_dim on SWA vs full-attention layers — full layers use
+    // n_embd_head_k/v, SWA layers use these. Default 0 => same as non-SWA.
+    // Read from gguf keys "%s.attention.{key,value}_length_swa".
+    uint32_t n_embd_head_k_swa = 0;
+    uint32_t n_embd_head_v_swa = 0;
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_rel_attn_bkts = 0;
@@ -245,6 +252,12 @@ struct llama_hparams {
     uint32_t n_head(uint32_t il = 0) const;
 
     uint32_t n_head_kv(uint32_t il = 0) const;
+
+    // Per-layer head dim. Used by Gemma 4 (different head_dim on SWA layers).
+    // For models without n_embd_head_k_swa set, returns n_embd_head_k for all
+    // layers — matches the existing (non-per-layer) field semantics.
+    uint32_t n_embd_head_k_il(uint32_t il) const;
+    uint32_t n_embd_head_v_il(uint32_t il) const;
 
     uint32_t n_ff(uint32_t il = 0) const;
 

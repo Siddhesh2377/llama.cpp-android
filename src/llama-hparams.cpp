@@ -35,6 +35,20 @@ uint32_t llama_hparams::n_head(uint32_t il) const {
     GGML_ABORT("fatal error");
 }
 
+uint32_t llama_hparams::n_embd_head_k_il(uint32_t il) const {
+    if (n_embd_head_k_swa != 0 && is_swa(il)) {
+        return n_embd_head_k_swa;
+    }
+    return n_embd_head_k;
+}
+
+uint32_t llama_hparams::n_embd_head_v_il(uint32_t il) const {
+    if (n_embd_head_v_swa != 0 && is_swa(il)) {
+        return n_embd_head_v_swa;
+    }
+    return n_embd_head_v;
+}
+
 uint32_t llama_hparams::n_head_kv(uint32_t il) const {
     if (il < n_layer) {
         return n_head_kv_arr[il];

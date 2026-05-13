@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <stdexcept>
+
 // get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
 static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
     GGML_ASSERT(idx < (int) x->ne[2]);
@@ -38,15 +40,18 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     }
 
     for (int il = 0; il < n_layer; ++il) {
-        const int64_t n_embd_head = hparams.n_embd_head_k(il);
-        GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
+        const int64_t n_embd_head = hparams.n_embd_head_k_il(il);
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_v_il(il));
 
         const int64_t n_head    = hparams.n_head(il);
         const int64_t n_head_kv = hparams.n_head_kv(il);
 
         const float freq_base_l  = model.get_rope_freq_base(cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
-        const int   n_rot_l      = hparams.n_rot(il);
+        // Upstream uses per-layer hparams.n_rot(il); our fork still has n_rot
+        // as a single field across layers — fine for gemma4 since both SWA
+        // and full layers use the same rope dim in this build.
+        const int   n_rot_l      = hparams.n_rot;
 
         // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -125,6 +130,14 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         // feed-forward network
         const bool is_moe_layer = model.layers[il].ffn_gate_inp != nullptr;
         if (is_moe_layer) {
+            // The MoE branch matches upstream Gemma 4 26B-A4B and uses an
+            // extended build_moe_ffn() signature with per-expert scale tensors
+            // (up_exps_s / gate_exps_s / down_exps_s). Our fork doesn't carry
+            // those signature overloads yet. Throw at runtime — dense gemma4
+            // variants (4B / E2B / E4B / 31B) never hit this branch because
+            // their layers don't carry ffn_gate_inp.
+            throw std::runtime_error("Gemma 4 MoE variants not supported in this build — use a dense gemma4 variant");
+#ifdef GEMMA4_MOE_SUPPORTED
             // MLP (shared exp)
             ggml_tensor * cur_mlp = build_norm(attn_out,
                     model.layers[il].ffn_norm, nullptr,
@@ -177,6 +190,7 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
 
             cur = ggml_add(ctx0, cur_mlp, cur_moe);
             cb(cur, "ffn_moe_combined", il);
+#endif // GEMMA4_MOE_SUPPORTED
         } else {
             cur = build_norm(attn_out,
                     model.layers[il].ffn_norm, nullptr,

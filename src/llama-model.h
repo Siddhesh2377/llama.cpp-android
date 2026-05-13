@@ -297,6 +297,10 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
 
+    // Gemma 4 MoE — scale tensor applied alongside ffn_down_exps. Loaded
+    // from tensor name `*.ffn_down_exps_s.weight` for the 26B-A4B variant.
+    struct ggml_tensor * ffn_down_exps_s    = nullptr;
+
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
     struct ggml_tensor * ffn_gate_shexp     = nullptr;
