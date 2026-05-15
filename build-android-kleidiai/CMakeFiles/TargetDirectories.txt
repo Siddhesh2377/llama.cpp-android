@@ -56,6 +56,7 @@
 /home/home/dev/include/llama.cpp/build-android-kleidiai/common/CMakeFiles/install/strip.dir
 /home/home/dev/include/llama.cpp/build-android-kleidiai/engine/CMakeFiles/tn-engine.dir
 /home/home/dev/include/llama.cpp/build-android-kleidiai/engine/CMakeFiles/vlm-bench.dir
+/home/home/dev/include/llama.cpp/build-android-kleidiai/engine/CMakeFiles/kernel-microbench.dir
 /home/home/dev/include/llama.cpp/build-android-kleidiai/engine/CMakeFiles/test.dir
 /home/home/dev/include/llama.cpp/build-android-kleidiai/engine/CMakeFiles/edit_cache.dir
 /home/home/dev/include/llama.cpp/build-android-kleidiai/engine/CMakeFiles/rebuild_cache.dir

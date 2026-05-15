@@ -120,3 +120,14 @@ events:
     message: |
       The system is: Linux - 6.12.77-1-MANJARO - x86_64
 ...
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 6.12.85-1-MANJARO - x86_64
+...
