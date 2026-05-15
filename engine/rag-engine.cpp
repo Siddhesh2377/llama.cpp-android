@@ -669,6 +669,43 @@ void rag_engine_free_string(char * str) {
     free(str);
 }
 
+float * rag_engine_encode(rag_engine_t * engine, const char * text,
+                          bool normalize, int32_t * out_n_embd) {
+    if (!engine || !engine->ctx || !text || !out_n_embd) return nullptr;
+    *out_n_embd = 0;
+    auto tokens = rag_tokenize(engine, text);
+    if (tokens.empty()) return nullptr;
+    auto tok_embs = rag_encode_tokens(engine, tokens.data(), (int32_t)tokens.size());
+    if (tok_embs.empty()) return nullptr;
+    const int32_t n_embd = engine->n_embd;
+    if (n_embd <= 0) return nullptr;
+    float * out = (float *)malloc((size_t)n_embd * sizeof(float));
+    if (!out) return nullptr;
+    for (int32_t d = 0; d < n_embd; d++) out[d] = 0.0f;
+    const int32_t n_tok = (int32_t)tokens.size();
+    for (int32_t i = 0; i < n_tok; i++) {
+        const float * tok = tok_embs.data() + (size_t)i * n_embd;
+        for (int32_t d = 0; d < n_embd; d++) out[d] += tok[d];
+    }
+    const float inv = 1.0f / (float)n_tok;
+    for (int32_t d = 0; d < n_embd; d++) out[d] *= inv;
+    if (normalize) {
+        float norm = 0.0f;
+        for (int32_t d = 0; d < n_embd; d++) norm += out[d] * out[d];
+        norm = sqrtf(norm);
+        if (norm > 1e-12f) {
+            const float inv_norm = 1.0f / norm;
+            for (int32_t d = 0; d < n_embd; d++) out[d] *= inv_norm;
+        }
+    }
+    *out_n_embd = n_embd;
+    return out;
+}
+
+void rag_engine_free_floats(float * buf) {
+    free(buf);
+}
+
 char * rag_engine_extract_text(const uint8_t * bytes, int32_t len,
     const char * mime_hint, const char * name_hint)
 {

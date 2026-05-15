@@ -64,6 +64,14 @@ void         rag_engine_free_results(rag_result * results, int32_t n);
 char *       rag_engine_build_prompt(rag_engine_t * engine,
                  const char * query, const char * user_prompt);
 
+// Embed a text string into a raw mean-pooled embedding at the model's native
+// n_embd (no Matryoshka truncation, no BQ quantization). Optionally L2
+// normalizes. Caller frees the returned buffer via rag_engine_free_floats.
+// Returns NULL on tokenize/encode failure; sets *out_n_embd on success.
+float *      rag_engine_encode(rag_engine_t * engine,
+                 const char * text, bool normalize, int32_t * out_n_embd);
+void         rag_engine_free_floats(float * buf);
+
 // Info
 char *       rag_engine_info_json(const rag_engine_t * engine);
 void         rag_engine_free_string(char * str);
