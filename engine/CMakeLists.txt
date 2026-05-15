@@ -63,3 +63,14 @@ target_compile_features(vlm-bench PRIVATE cxx_std_17)
 if(ANDROID)
     target_link_libraries(vlm-bench PRIVATE log)
 endif()
+
+# ── kernel-microbench ────────────────────────────────────────────────────────
+# Single-op timing harness for chasing kernel-level regressions (i8mm n=1,
+# repack, etc.). Push to /data/local/tmp and run via adb. See top of
+# kernel-microbench.cpp for argv flags.
+add_executable(kernel-microbench kernel-microbench.cpp)
+target_link_libraries(kernel-microbench PRIVATE tn-engine)
+target_compile_features(kernel-microbench PRIVATE cxx_std_17)
+if(ANDROID)
+    target_link_libraries(kernel-microbench PRIVATE log)
+endif()
