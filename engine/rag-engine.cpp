@@ -138,11 +138,35 @@ static int32_t rag_load_model_impl(rag_engine_t * engine, llama_model * model) {
     return 0;
 }
 
+// Tuned for embedding models loaded into a process that already hosts a
+// causal-LM (the common case: LLM in g_state, then a PDF triggers RAG).
+//
+//   use_mmap = false
+//       The mmap path inside llama.cpp's tensor loader triggered a hard
+//       GGML_ABORT in load_tensors when nomic-bert was the second/third
+//       model in the same process (verified reproducer: Qwen3-VL + mmproj
+//       loaded, then nomic load died ~140 ms after `load_tensors:` with
+//       SIGABRT si_code=-1 that bypassed C++ try/catch via pdfium's
+//       libunwind tables — see gguf_lib/CLAUDE.md). Reading the file
+//       through the normal alloc-then-fread path avoids the bad branch.
+//       Cost is small: 84 MB nomic adds ~50 ms vs mmap on a fresh process,
+//       paid once per RAG session.
+//
+//   use_extra_bufts = false
+//       Repacking into backend-specific buffer types (KleidiAI / AArch64)
+//       is a generation-side perf win. Embeddings encode each chunk once
+//       and discard, so the repack tax never pays back, and removing it
+//       eliminates one more source of unsupported-quant aborts.
+static void rag_apply_embedding_model_params(llama_model_params & p) {
+    p.use_mmap        = true;
+    p.use_extra_bufts = false;
+}
+
 int32_t rag_engine_load_model(rag_engine_t * engine, const char * path) {
     if (!engine || !path) return -1;
 
     auto model_params = llama_model_default_params();
-    model_params.use_mmap = true;
+    rag_apply_embedding_model_params(model_params);
     llama_model * model = llama_model_load_from_file(path, model_params);
 
     return rag_load_model_impl(engine, model);
@@ -155,7 +179,7 @@ int32_t rag_engine_load_model_from_fd(rag_engine_t * engine, int fd) {
     snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
 
     auto model_params = llama_model_default_params();
-    model_params.use_mmap = true;
+    rag_apply_embedding_model_params(model_params);
     llama_model * model = llama_model_load_from_file(fd_path, model_params);
 
     return rag_load_model_impl(engine, model);
