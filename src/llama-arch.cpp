@@ -2593,7 +2593,22 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
-    {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // do the norms on the first layer (not the input layer)
+    // Reverted to LAYER_INPUT (was LAYER_REPEATING in upstream PR #21612
+    // "gemma: perform per-layer projections in the first layer"). The
+    // REPEATING classification is inconsistent with every call site in
+    // llama-model.cpp that constructs this tensor: BERT, NOMIC_BERT,
+    // NOMIC_BERT_MOE, JINA_BERT_V3, plus all the BLOOM / GPTNEOX /
+    // POSNET variants — all 13 sites call tn(LLM_TENSOR_TOKEN_EMBD_NORM,
+    // "weight") with NO bid, because the GGUF tensor name is literally
+    // "token_embd_norm.weight" (no blk.%d prefix). REPEATING then trips
+    // the sanity check in load_tensors() create_tensor, which calls
+    // GGML_ABORT("repeating layer tensor X used without a layer number")
+    // — a hard abort() that bypasses C++ exception handling and dies
+    // with SIGABRT si_code=-1 before any catch can fire. The Gemma
+    // optimization the PR wanted (run the norm op on layer 0's device
+    // instead of the input device) only matters for multi-GPU offload;
+    // on the CPU-only Android target it's a no-op.
+    {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
     {LLM_TENSOR_OUTPUT,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS_OUT,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
